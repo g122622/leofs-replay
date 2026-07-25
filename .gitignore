@@ -1,0 +1,31 @@
+# 构建产物
+/build/
+/out/
+/bin/
+/lib/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake.user
+compile_commands.json
+
+# 编译器/IDE
+.vs/
+.vscode/
+.idea/
+*.o
+*.obj
+*.a
+*.lib
+*.pdb
+*.exe
+
+# Claude / 本地会话
+.claude/
+
+# 临时与备份
+*.log
+*.tmp
+*~

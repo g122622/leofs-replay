@@ -1,0 +1,18 @@
+{
+  "events_root": "/trace/spark2/results/neuron/rawproc",
+  "sandbox_root": "/tmp/trace-replay-sandbox",
+  "bucket_width": 6,
+  "bucket_min": 0,
+  "bucket_max": -1,
+
+  "pace_mode": "fast",
+  "speed": 1.0,
+
+  "side_filter": "all",
+  "skip_unparsed": true,
+  "pid_filter": [],
+
+  "dry_run": true,
+  "max_io_bytes": 1048576,
+  "continue_on_error": true
+}
