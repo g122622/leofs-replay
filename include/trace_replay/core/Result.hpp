@@ -49,7 +49,8 @@ public:
     Result(Error error) : m_error(std::move(error)) {}
 
     [[nodiscard]] bool success() const noexcept { return !m_error.has_value(); }
-    [[nodiscard]] bool ok() const noexcept { return success(); }
+    // 注意：不提供 bool ok() 成员，与下方静态 Result<void>::ok() 同名会冲突；
+    // 调用方用 success() 或 operator bool 判定成功。
     [[nodiscard]] explicit operator bool() const noexcept { return success(); }
 
     [[nodiscard]] const Error& error() const& { return *m_error; }

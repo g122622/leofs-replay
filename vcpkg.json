@@ -1,0 +1,12 @@
+{
+  "name": "trace-replay",
+  "version-string": "0.1.0",
+  "dependencies": [
+    {
+      "name": "arrow",
+      "default-features": true,
+      "features": ["parquet"]
+    },
+    "nlohmann-json"
+  ]
+}

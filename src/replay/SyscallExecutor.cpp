@@ -3,6 +3,17 @@
 #include "trace_replay/core/Error.hpp"
 #include "trace_replay/core/SyscallClassify.hpp"
 
+#include <filesystem>
+#include <format>
+#include <ostream>
+#include <string>
+
+#ifndef _WIN32
+// ============================================================================
+// POSIX 实现：在 Linux/macOS 下真实执行 syscall。
+// 真实回放依赖 openat/read/write/rename 等 POSIX 接口，trace 本身是 Linux
+// bpftrace 产物，故在非 Windows 平台构建运行。
+// ============================================================================
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -12,8 +23,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
-#include <format>
-#include <ostream>
 #include <vector>
 
 namespace trace_replay {
@@ -89,9 +98,7 @@ Result<ExecOutcome> SyscallExecutor::doOpen(const TraceEvent& ev)
     TR_TRY(resolved, m_resolver.resolve(ev, m_fdTable));
 
     // 原始 trace 的 arg2 为 open flags（对 openat: arg1=dirfd, arg2=flags）。
-    // open/openat2 参数布局不同，这里统一用 translateOpenFlags 做尽力转换。
     const int flags = translateOpenFlags(ev.arg2Num);
-    // O_CREAT 时需要 mode，原始 trace 通常不携带，用 0644
     const mode_t mode = (flags & O_CREAT) ? 0644 : 0;
 
     int ourFd = ::open(resolved.c_str(), flags, mode);
@@ -108,7 +115,6 @@ Result<ExecOutcome> SyscallExecutor::doOpen(const TraceEvent& ev)
             "SyscallExecutor::doOpen");
     }
 
-    // 登记 (pid, origFd) → (ourFd, path)。origFd 取原始 trace 的 ret（成功 fd）。
     if (ev.ret >= 0) {
         struct stat st {};
         bool isDir = (::fstat(ourFd, &st) == 0) && S_ISDIR(st.st_mode);
@@ -128,7 +134,6 @@ Result<ExecOutcome> SyscallExecutor::doIo(const TraceEvent& ev)
     const Fd origFd = static_cast<Fd>(ev.arg1Num);
     const FdEntry* e = m_fdTable.lookup(ev.pid, origFd);
     if (!e) {
-        // 原始 trace 中 fd 未登记（如 fd 在录制开始前已打开），跳过而非报错
         return skipped(std::format("IO 未找到 fd 映射: pid={} fd={}", ev.pid, origFd));
     }
 
@@ -151,7 +156,6 @@ Result<ExecOutcome> SyscallExecutor::doIo(const TraceEvent& ev)
             ::write(e->ourFd, buf.data(), buf.size());
         }
     } else if (ev.sc == "readv" || ev.sc == "writev") {
-        // 用单个 iovec 简化
         iovec iov{buf.data(), buf.size()};
         if (ev.sc == "readv") ::readv(e->ourFd, &iov, 1);
         else                  ::writev(e->ourFd, &iov, 1);
@@ -183,7 +187,6 @@ Result<ExecOutcome> SyscallExecutor::doStatLike(const TraceEvent& ev)
     struct stat st {};
     if (::stat(resolved.c_str(), &st) < 0) {
         const int e = errno;
-        // 文件不存在于沙箱中属正常（replay 是按需重建），不算硬错误
         return skipped(std::format("{} 目标不存在: {} (errno={})", ev.sc, resolved.string(), e));
     }
     return ExecOutcome{true, false,
@@ -226,11 +229,10 @@ Result<ExecOutcome> SyscallExecutor::doRename(const TraceEvent& ev)
     // 这里单独解析源侧（用 renameSrc）。
     TraceEvent srcEv = ev;
     srcEv.path = ev.renameSrc;
-    srcEv.renameDst.clear();   // 令 resolve 取 path 而非 renameDst
+    srcEv.renameDst.clear();
     TR_TRY(srcResolved, m_resolver.resolve(srcEv, m_fdTable));
     TR_TRY(dstResolved, m_resolver.resolve(ev, m_fdTable));
 
-    // 确保目标父目录存在，避免因父目录缺失而 rename 失败
     std::error_code ec;
     fs::create_directories(dstResolved.parent_path(), ec);
 
@@ -247,5 +249,33 @@ Result<ExecOutcome> SyscallExecutor::doRename(const TraceEvent& ev)
     return ExecOutcome{true, false,
         std::format("rename {} -> {}", srcResolved.string(), dstResolved.string())};
 }
+
+#else
+// ============================================================================
+// Windows 占位实现
+//
+// 真实 syscall 回放依赖 POSIX 接口（openat/pread64/rename...），在 Windows 上
+// 无对应物。Windows 构建仅用于校验解析、排序、fd 表、路径解析等跨平台逻辑
+// （DryRunExecutor 路径）。SyscallExecutor 在 Windows 下构造合法但 execute
+// 一律返回"平台不支持"，保证整体可编译、可链接。
+// ============================================================================
+
+namespace trace_replay {
+
+SyscallExecutor::SyscallExecutor(std::filesystem::path sandboxRoot, i64 maxIoBytes,
+                                 bool continueOnError, std::ostream& log)
+    : m_resolver(std::move(sandboxRoot))
+    , m_maxIoBytes(maxIoBytes)
+    , m_continueOnError(continueOnError)
+    , m_log(log) {}
+
+Result<ExecOutcome> SyscallExecutor::execute(const TraceEvent& ev)
+{
+    // 真实 syscall 回放仅在 POSIX 平台可用；Windows 下标记跳过
+    (void)ev;
+    return ExecOutcome{true, true, "Windows 平台不支持真实 syscall 回放，请用 DryRunExecutor"};
+}
+
+#endif  // _WIN32
 
 }  // namespace trace_replay

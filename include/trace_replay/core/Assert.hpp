@@ -10,6 +10,7 @@
 
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 
 namespace trace_replay::detail {
 

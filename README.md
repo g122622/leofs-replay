@@ -84,12 +84,34 @@ trace_replay config.json
 ## 构建依赖
 
 - C++20
-- Apache Arrow（含 Parquet）：`vcpkg install arrow[parquet]` 或 conan
+- Apache Arrow（含 Parquet）：`vcpkg install arrow[parquet]` 或经 manifest 自动安装
 - nlohmann_json：`vcpkg install nlohmann-json`
-- 真实 syscall 执行器（`SyscallExecutor`）依赖 POSIX（`openat`/`read`/`rename` 等），在 Linux 下构建运行；Windows 下仅 `DryRunExecutor` 路径与解析层可编译。
+
+## 构建（Windows / clang）
+
+项目提供 `scripts/configure.bat`，自动注入 VS 开发环境（vcpkg 需 `cl.exe` 定位
+工具链，本机的 VS 预览版不被 `vswhere` 识别，必须先注入环境）。
+
+```bat
+:: 配置（manifest 模式自动装 arrow/nlohmann-json）
+scripts\configure.bat
+
+:: 配置 + 构建
+scripts\configure.bat build
+```
+
+该脚本使用 `clang++`（GNU 风格命令行）+ Ninja Multi-Config，产物在
+`build/bin/Debug/trace_replay.exe` 与 `build/bin/Release/trace_replay.exe`，运行时
+依赖的 Arrow/Parquet DLL 由 vcpkg 自动部署到同目录。
+
+> 真实 syscall 执行器（`SyscallExecutor`）依赖 POSIX（`openat`/`read`/`rename` 等），
+> 仅在 Linux 构建运行；Windows 下 `SyscallExecutor` 为占位实现（`execute` 一律返回
+> "平台不支持"），仅 `DryRunExecutor` 路径与解析层可实际运行。如需 Windows 真实回放，
+> 需将 syscall 层移植到 Win32 API。
 
 ## 已知 TODO
 
 - `dup`/`dup2`/`dup3`、`exit(group)` 对 fd 表的影响尚未覆盖。
 - `getdents`/`utimensat`/xattr 等暂未真实执行（标记 skipped）。
 - 单元测试框架尚未接入（`TR_TRACE_REPLAY_BUILD_TESTS` 占位）。
+- Windows 下 `SyscallExecutor` 为占位实现，真实回放需移植到 Win32 API。

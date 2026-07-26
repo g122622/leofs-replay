@@ -1,6 +1,22 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ============================================================================
+# vcpkg 集成（必须在 project() 之前）
+#
+# 与参考项目（Cubium）一致的写法：若环境提供 VCPKG_ROOT 则自动接入 vcpkg
+# 工具链，从而在 manifest 模式下自动安装 arrow / nlohmann-json。
+# 注意：Windows 上需先经 VsDevCmd.bat 注入 VS 开发环境，使 cl.exe 进入 PATH，
+# 否则 vcpkg 无法定位 VS 实例（本机的 VS 18 预览版不被 vswhere 识别）。
+# ============================================================================
+if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        CACHE STRING "Vcpkg toolchain file")
+elseif(EXISTS "E:/vcpkg/scripts/buildsystems/vcpkg.cmake" AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    set(CMAKE_TOOLCHAIN_FILE "E:/vcpkg/scripts/buildsystems/vcpkg.cmake"
+        CACHE STRING "Vcpkg toolchain file")
+endif()
+
+# ============================================================================
 # trace-replay —— 按时间序列回放 rawproc 排序后 Parquet trace 的事件流
 #
 # 设计核心（与 rawproc 分工对齐）：
@@ -23,7 +39,6 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 option(TR_TRACE_REPLAY_BUILD_TESTS "构建 trace-replay 的单元测试" OFF)
 
@@ -39,22 +54,15 @@ set_project_warnings(TraceReplayWarnings)
 # ----------------------------------------------------------------------------
 
 # 解析 rawproc 产出的 Parquet，依赖 Apache Arrow。
-find_package(Arrow QUIET)
-find_package(Parquet QUIET)
-if(NOT Arrow_FOUND OR NOT Parquet_FOUND)
-    message(FATAL_ERROR
-        "未找到 Apache Arrow/Parquet。请安装并在 CMake 中配置 Arrow_DIR/Parquet_DIR，\n"
-        "例如 vcpkg: ./vcpkg install arrow[parquet] \n"
-        "或 conan: conan install arrow/... -o arrow:parquet=True")
-endif()
+find_package(Arrow CONFIG REQUIRED)
+find_package(Parquet CONFIG REQUIRED)
 
-# JSON 配置解析，使用 nlohmann/json（header-only，常见包管理器均可获取）。
-find_package(nlohmann_json QUIET CONFIG)
-if(NOT nlohmann_json_FOUND)
-    message(WARNING
-        "未找到 nlohmann_json，将假定其头文件位于标准搜索路径。\n"
-        "建议: vcpkg install nlohmann-json 或 conan install nlohmann_json/...")
-endif()
+# JSON 配置解析，使用 nlohmann/json（header-only）。
+find_package(nlohmann_json CONFIG REQUIRED)
+
+# 选择 Arrow 链接目标：动态库优先（vcpkg x64-windows 默认动态）。
+set(_ARROW_TARGET "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,Arrow::arrow_static,Arrow::arrow_shared>")
+set(_PARQUET_TARGET "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,Parquet::parquet_static,Parquet::parquet_shared>")
 
 # ============================================================================
 # 核心静态库：解析、排序归并、fd 表、路径解析、replay 引擎
@@ -74,14 +82,10 @@ add_library(TraceReplayCore STATIC
 )
 target_link_libraries(TraceReplayCore PUBLIC
     TraceReplayWarnings
-    parquet::parquet_shared
-    arrow::arrow_shared
+    ${_ARROW_TARGET}
+    ${_PARQUET_TARGET}
+    nlohmann_json::nlohmann_json
 )
-if(nlohmann_json_FOUND)
-    target_link_libraries(TraceReplayCore PUBLIC nlohmann_json::nlohmann_json)
-else()
-    target_compile_definitions(TraceReplayCore PUBLIC TRACE_REPLAY_HAVE_NLOHMANN_JSON)
-endif()
 
 # ============================================================================
 # 可执行入口
