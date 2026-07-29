@@ -2,6 +2,7 @@
 
 #include "trace_replay/core/Error.hpp"
 #include "trace_replay/core/SyscallClassify.hpp"
+#include "trace_replay/core/TraceEventUtil.hpp"
 
 #include <filesystem>
 #include <format>
@@ -35,10 +36,15 @@ ExecOutcome skipped(std::string why)
     return ExecOutcome{true, true, std::move(why)};
 }
 
-/// 把 Linux open flags（原始 trace arg2 的十六进制）映射为本进程可用的 open flags。
+/// 把 Linux open flags 映射为本进程可用的 open flags。
 /// 我们不需要精确复刻原始 flag，只需保证"以合理方式打开"以承接后续 IO。
-/// Linux 取值：O_RDONLY=0 O_WRONLY=1 O_RDWR=2；O_CREAT=0100(0x40) O_EXCL=0200(0x80)
-///              O_TRUNC=01000(0x200) O_APPEND=02000(0x400)
+///
+/// 真实 rawproc 输出（已验证）：openat 的 arg1 = flags（【十进制】整数），
+/// 例如 524288 = 0x80000 = O_CLOEXEC。这里按位解析这些 Linux 取值：
+///   访问模式低两位：O_RDONLY=0 O_WRONLY=1 O_RDWR=2
+///   O_CREAT  = 0100(0x40)   O_EXCL   = 0200(0x80)
+///   O_TRUNC  = 01000(0x200) O_APPEND = 02000(0x400)
+///   O_CLOEXEC= 02000000(0x80000) —— 原始若有则保留语义（本进程一律加 CLOEXEC）
 int translateOpenFlags(i64 origFlags)
 {
     int flags = O_CLOEXEC;   // 回放进程默认 close-on-exec，避免 fd 泄漏
@@ -48,10 +54,11 @@ int translateOpenFlags(i64 origFlags)
         case 0x2: flags |= O_RDWR;   break;
         default: flags |= O_RDONLY;  break;
     }
-    if (origFlags & 0x40)  flags |= O_CREAT;
-    if (origFlags & 0x80)  flags |= O_EXCL;
-    if (origFlags & 0x200) flags |= O_TRUNC;
-    if (origFlags & 0x400) flags |= O_APPEND;
+    if (origFlags & 0x40)    flags |= O_CREAT;
+    if (origFlags & 0x80)    flags |= O_EXCL;
+    if (origFlags & 0x200)   flags |= O_TRUNC;
+    if (origFlags & 0x400)   flags |= O_APPEND;
+    // O_CLOEXEC(0x80000)：本进程已默认带，无需额外处理
     return flags;
 }
 
@@ -97,8 +104,9 @@ Result<ExecOutcome> SyscallExecutor::doOpen(const TraceEvent& ev)
     // 解析沙箱内路径（含防穿越校验）
     TR_TRY(resolved, m_resolver.resolve(ev, m_fdTable));
 
-    // 原始 trace 的 arg2 为 open flags（对 openat: arg1=dirfd, arg2=flags）。
-    const int flags = translateOpenFlags(ev.arg2Num);
+    // 真实 rawproc 输出：openat 的 arg1 = flags（十进制），arg2 = mode 之类。
+    // 故 flags 取自 arg1Num。
+    const int flags = translateOpenFlags(ev.arg1Num);
     const mode_t mode = (flags & O_CREAT) ? 0644 : 0;
 
     int ourFd = ::open(resolved.c_str(), flags, mode);
@@ -118,8 +126,9 @@ Result<ExecOutcome> SyscallExecutor::doOpen(const TraceEvent& ev)
     if (ev.ret >= 0) {
         struct stat st {};
         bool isDir = (::fstat(ourFd, &st) == 0) && S_ISDIR(st.st_mode);
+        // 登记时用 bestLookupPath（canonical_path 优先）作为反查键，与 IO/close 一致
         m_fdTable.registerFd(ev.pid, static_cast<Fd>(ev.ret), ourFd,
-                             resolved.string(), isDir);
+                             std::string{bestLookupPath(ev)}, isDir);
     } else {
         // 原始失败但我们打开了：为保持 fd 表与原始一致，立即关闭我们的 fd
         ::close(ourFd);
@@ -130,15 +139,23 @@ Result<ExecOutcome> SyscallExecutor::doOpen(const TraceEvent& ev)
 
 Result<ExecOutcome> SyscallExecutor::doIo(const TraceEvent& ev)
 {
-    // 以 fd 为准：arg1 即原始 fd
-    const Fd origFd = static_cast<Fd>(ev.arg1Num);
-    const FdEntry* e = m_fdTable.lookup(ev.pid, origFd);
+    // fd 跟踪改为 path 反查：read/write 的 arg1 是字节数 count，不是 fd。
+    // 优先用 bestLookupPath（canonical_path 优先，退化 path）在该 pid 下反查 ourFd；
+    // 若 path 为 "/[unknown, fd=N]" 形态，提取 N 走 fd 直查回退。
+    const std::string_view lookupPath = bestLookupPath(ev);
+    const FdEntry* e = nullptr;
+    if (auto fd = extractUnknownFd(lookupPath)) {
+        e = m_fdTable.lookup(ev.pid, *fd);
+    } else {
+        e = m_fdTable.lookupByPath(ev.pid, lookupPath);
+    }
     if (!e) {
-        return skipped(std::format("IO 未找到 fd 映射: pid={} fd={}", ev.pid, origFd));
+        return skipped(std::format("IO 未找到 fd 映射: pid={} path=\"{}\"", ev.pid, lookupPath));
     }
 
     // 原始 ret = 实际读写字节数。复现"该 fd 上发生 N 字节 IO"的时间序列语义，
     // 不复现数据内容（trace 无负载）。read 用零缓冲，write 写零字节占位。
+    // arg1Num = 请求字节数（pread64/pwrite64 的 offset 在 arg2Num）。
     const i64 wantBytes = ev.ret > 0 ? ev.ret : 0;
     const i64 ioLen = std::min(wantBytes, m_maxIoBytes);
     std::vector<char> buf(static_cast<size_t>(ioLen), 0);
@@ -166,10 +183,16 @@ Result<ExecOutcome> SyscallExecutor::doIo(const TraceEvent& ev)
 
 Result<ExecOutcome> SyscallExecutor::doClose(const TraceEvent& ev)
 {
-    const Fd origFd = static_cast<Fd>(ev.arg1Num);
-    auto ourFd = m_fdTable.unregisterFd(ev.pid, origFd);
+    // close 的 arg1/ret 均为 0，fd 信息不在 arg，同样靠 path 反查。
+    const std::string_view lookupPath = bestLookupPath(ev);
+    std::optional<Fd> ourFd;
+    if (auto fd = extractUnknownFd(lookupPath)) {
+        ourFd = m_fdTable.unregisterFd(ev.pid, *fd);
+    } else {
+        ourFd = m_fdTable.unregisterByPath(ev.pid, lookupPath);
+    }
     if (!ourFd) {
-        return skipped(std::format("close 未找到 fd 映射: pid={} fd={}", ev.pid, origFd));
+        return skipped(std::format("close 未找到 fd 映射: pid={} path=\"{}\"", ev.pid, lookupPath));
     }
     if (::close(*ourFd) < 0) {
         const int e = errno;
@@ -178,7 +201,7 @@ Result<ExecOutcome> SyscallExecutor::doClose(const TraceEvent& ev)
             "SyscallExecutor::doClose");
     }
     return ExecOutcome{true, false,
-        std::format("close ourFd={} (origFd={})", *ourFd, origFd)};
+        std::format("close ourFd={} (path=\"{}\")", *ourFd, lookupPath)};
 }
 
 Result<ExecOutcome> SyscallExecutor::doStatLike(const TraceEvent& ev)

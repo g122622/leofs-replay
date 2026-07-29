@@ -59,6 +59,13 @@ Result<ReplayStats> ReplayEngine::run()
             continue;
         }
 
+        // 事件上限（有界 dry-run）：达到即停，不再处理后续事件
+        if (m_cfg.maxEvents > 0 && stats.processed + stats.failed >= m_cfg.maxEvents) {
+            m_log << std::format("[engine] 达到 max_events 上限 {}，停止回放\n",
+                                 m_cfg.maxEvents);
+            break;
+        }
+
         // 节拍：按原始时间分布插入等待
         m_pacer.pace(ev.machineTs);
 

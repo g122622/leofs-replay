@@ -41,6 +41,23 @@ std::string getString(const json& j, const char* key, std::string def = {})
     return def;
 }
 
+/// 把 nlohmann json 返回的 UTF-8 std::string 转为 fs::path。
+///
+/// 关键：在 Windows 上 fs::path(std::string) 会按系统 ACP（CP_ACP）解释字节，
+/// 非非 ASCII 路径（如含中文"下载"的目录）会被损坏，导致 fs::exists/Open 失败。
+/// nlohmann json 的字符串是 UTF-8，故这里经 u8string 中转，让 fs::path 按
+/// UTF-8 解码，跨平台正确处理任意 Unicode 路径。
+fs::path utf8ToPath(std::string_view s)
+{
+#if defined(_WIN32)
+    // Windows：fs::path(u8string) 按 UTF-8 解码为内部 UTF-16 存储
+    return fs::path{std::u8string{s.begin(), s.end()}};
+#else
+    // POSIX：原生 char 即 UTF-8，直接构造
+    return fs::path{std::string{s}};
+#endif
+}
+
 /// 安全地取整型字段
 template <typename Int>
 Int getInt(const json& j, const char* key, Int def)
@@ -98,13 +115,13 @@ Result<ReplayConfig> ReplayConfig::loadFromJson(std::string_view path)
     }
 
     // 输入
-    cfg.eventsRoot   = fs::path{getString(j, "events_root")};
+    cfg.eventsRoot   = utf8ToPath(getString(j, "events_root"));
     cfg.bucketWidth  = getInt(j, "bucket_width", 6);
     cfg.bucketMin    = getInt(j, "bucket_min", 0);
     cfg.bucketMax    = getInt(j, "bucket_max", -1);
 
     // 沙箱
-    cfg.sandboxRoot  = fs::path{getString(j, "sandbox_root")};
+    cfg.sandboxRoot  = utf8ToPath(getString(j, "sandbox_root"));
 
     // 节拍
     cfg.paceMode     = parsePaceMode(getString(j, "pace_mode", "fast"));
@@ -118,6 +135,7 @@ Result<ReplayConfig> ReplayConfig::loadFromJson(std::string_view path)
     cfg.dryRun         = getBool(j, "dry_run", false);
     cfg.maxIoBytes     = getInt(j, "max_io_bytes", 1 << 20);
     cfg.continueOnError = getBool(j, "continue_on_error", true);
+    cfg.maxEvents      = static_cast<u64>(getInt<i64>(j, "max_events", 0));
 
     // pid 过滤列表
     cfg.pidFilter.clear();

@@ -52,11 +52,27 @@ Result<void> EventMerger::open(const ReplayConfig& cfg)
 {
     TR_ASSERT(!m_opened);
 
-    const fs::path tsorted = cfg.eventsRoot / "events_tsorted";
     std::error_code ec;
+
+    // —— 单文件直读模式 ——
+    // 当 events_root 直接指向一个 .parquet 文件时，绕过分桶目录枚举，
+    // 只挂一个读取器。文件已全局排序，K 路堆退化为直通。
+    if (fs::is_regular_file(cfg.eventsRoot, ec) &&
+        cfg.eventsRoot.extension() == ".parquet") {
+        m_readers.reserve(1);
+        m_heads.resize(1);
+        m_done.assign(1, false);
+        m_readers.push_back(std::make_unique<ParquetEventReader>(cfg.eventsRoot, 0));
+        m_opened = true;
+        TR_TRY_VOID(primeHeap());
+        return Result<void>::ok();
+    }
+
+    const fs::path tsorted = cfg.eventsRoot / "events_tsorted";
     if (!fs::exists(tsorted, ec)) {
         return Error::notFound(
-            "未找到 events_tsorted 目录: " + tsorted.string(),
+            "未找到 events_tsorted 目录: " + tsorted.string() +
+            "（events_root 也可直接指向单个 .parquet 文件）",
             "EventMerger::open");
     }
 

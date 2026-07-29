@@ -14,5 +14,6 @@
 
   "dry_run": true,
   "max_io_bytes": 1048576,
-  "continue_on_error": true
+  "continue_on_error": true,
+  "max_events": 0
 }

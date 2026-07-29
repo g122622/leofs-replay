@@ -65,6 +65,8 @@ struct ReplayConfig {
     i64 maxIoBytes {1 << 20};   // 默认 1 MiB
     /// 遇到 syscall 失败时是否继续（true=跳过并计数，false=中止）
     bool continueOnError {true};
+    /// 回放事件上限（>0 时处理到该数量即停，便于对大文件做有界 dry-run；0=不限）
+    u64 maxEvents {0};
 
     /**
      * @brief 从 JSON 配置文件加载

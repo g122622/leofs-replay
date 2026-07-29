@@ -101,23 +101,33 @@ double getDouble(const std::shared_ptr<arrow::ChunkedArray>& col, i64 row)
     return 0.0;
 }
 
-/// 解析原始 trace 中的十六进制参数串（arg1/arg2），如 "0x3" / "0xa"
-i64 parseHex(std::string_view s)
+/// 解析原始 trace 中的数值参数串。
+/// rawproc 把 ret/err/arg1/arg2 存为【十进制】字符串（如 openat 的 flags
+/// "524288"=0x80000=O_CLOEXEC，read 的字节数 "32768"）。仅当带 "0x" 前缀时
+/// 才按十六进制解析，兼容极少数原始行。
+i64 parseNum(std::string_view s)
 {
     if (s.empty()) {
         return 0;
     }
+    bool hex = false;
     if (s.starts_with("0x") || s.starts_with("0X")) {
         s.remove_prefix(2);
+        hex = true;
     }
     i64 value = 0;
     for (char c : s) {
         int digit = 0;
-        if (c >= '0' && c <= '9')      digit = c - '0';
-        else if (c >= 'a' && c <= 'f') digit = 10 + (c - 'a');
-        else if (c >= 'A' && c <= 'F') digit = 10 + (c - 'A');
-        else break;
-        value = value * 16 + digit;
+        if (c >= '0' && c <= '9') {
+            digit = c - '0';
+        } else if (hex && c >= 'a' && c <= 'f') {
+            digit = 10 + (c - 'a');
+        } else if (hex && c >= 'A' && c <= 'F') {
+            digit = 10 + (c - 'A');
+        } else {
+            break;
+        }
+        value = value * (hex ? 16 : 10) + digit;
     }
     return value;
 }
@@ -173,12 +183,26 @@ ParquetEventReader::ParquetEventReader(fs::path bucketDir, long bucket)
     : m_impl(std::make_unique<Impl>())
     , m_bucket(bucket)
 {
-    // 收集桶目录下所有 .parquet 文件（rawproc 可能在单桶内输出多个 part 文件）
+    // 收集待读的 .parquet 文件。支持两种输入：
+    //   1) bucketDir 是单个 .parquet 文件 —— 单文件直读模式（用户提供的扁平
+    //      part-xxxx.parquet，已全局排序，无需分桶）；
+    //   2) bucketDir 是目录 —— rawproc 桶目录，枚举其下所有 .parquet part 文件。
+    // 路径以 UTF-8 形式存入 partFiles：Arrow 的 std::string 路径 API 在所有平台
+    // 均按 UTF-8 解释，Windows 上若用 path::string()（ACP 编码）会损坏含中文的路径。
+    auto toUtf8 = [](const fs::path& p) -> std::string {
+        auto u8 = p.u8string();   // std::u8string，UTF-8 编码
+        return std::string{reinterpret_cast<const char*>(u8.data()), u8.size()};
+    };
     std::vector<std::string> partFiles;
     std::error_code ec;
-    for (auto& entry : fs::directory_iterator{bucketDir, ec}) {
-        if (entry.is_regular_file() && entry.path().extension() == ".parquet") {
-            partFiles.push_back(entry.path().string());
+    if (fs::is_regular_file(bucketDir, ec) &&
+        bucketDir.extension() == ".parquet") {
+        partFiles.push_back(toUtf8(bucketDir));
+    } else {
+        for (auto& entry : fs::directory_iterator{bucketDir, ec}) {
+            if (entry.is_regular_file() && entry.path().extension() == ".parquet") {
+                partFiles.push_back(toUtf8(entry.path()));
+            }
         }
     }
 
@@ -262,8 +286,15 @@ Result<std::optional<TraceEvent>> ParquetEventReader::next()
     ev.machineTs  = getDouble(c->machineTs, row);
     ev.logOffset  = getInt64(c->logOffset, row);
     ev.pid        = getInt64(c->pid, row);
-    ev.ret        = getInt64(c->ret, row);
-    ev.err        = getInt64(c->err, row);
+
+    // ret/err/arg1/arg2 在 rawproc 输出中是【字符串列】（十进制），这里解析。
+    //   openat: ret=fd(小整数), arg1=flags(如 524288=O_CLOEXEC)
+    //   read/write: ret=实际字节数, arg1=请求字节数(count), fd 不在此处
+    //   close: ret=0, fd 不在此处
+    ev.ret        = parseNum(sliceString(c->ret, row));
+    ev.err        = parseNum(sliceString(c->err, row));
+    ev.arg1Num    = parseNum(sliceString(c->arg1, row));
+    ev.arg2Num    = parseNum(sliceString(c->arg2, row));
 
     ev.comm          = std::string{sliceString(c->comm, row)};
     ev.sc            = std::string{sliceString(c->sc, row)};
@@ -273,10 +304,6 @@ Result<std::optional<TraceEvent>> ParquetEventReader::next()
     ev.canonicalPath = std::string{sliceString(c->canonicalPath, row)};
     // 不信赖 rawproc 的 op_class 列，按 sc 重新分类，保持本工具自洽
     ev.opClass = classifyOp(ev.sc);
-
-    // arg1/arg2 在原始 trace 是十六进制串，解析为数值。对 IO 操作 arg1=fd。
-    ev.arg1Num = parseHex(sliceString(c->arg1, row));
-    ev.arg2Num = parseHex(sliceString(c->arg2, row));
 
     if (c->mapped) {
         ev.mapped = getInt64(c->mapped, row) != 0;

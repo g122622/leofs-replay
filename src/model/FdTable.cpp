@@ -9,7 +9,16 @@ void FdTable::registerFd(i64 pid, Fd origFd, Fd ourFd,
 {
     TR_ASSERT(origFd >= 0);
     TR_ASSERT(ourFd >= 0);
-    m_table[pid][origFd] = FdEntry{ourFd, std::move(path), isDir};
+    auto& pp = m_table[pid];
+    // 若该 origFd 已存在（fd 复用），先从 path 索引移除旧 path 指向
+    auto it = pp.byFd.find(origFd);
+    if (it != pp.byFd.end() && !it->second.path.empty()) {
+        pp.byPath.erase(it->second.path);
+    }
+    pp.byFd[origFd] = FdEntry{ourFd, path, isDir};
+    if (!path.empty()) {
+        pp.byPath[path] = origFd;
+    }
 }
 
 std::optional<Fd> FdTable::unregisterFd(i64 pid, Fd origFd)
@@ -18,14 +27,42 @@ std::optional<Fd> FdTable::unregisterFd(i64 pid, Fd origFd)
     if (pit == m_table.end()) {
         return std::nullopt;
     }
-    auto fit = pit->second.find(origFd);
-    if (fit == pit->second.end()) {
+    auto& pp = pit->second;
+    auto fit = pp.byFd.find(origFd);
+    if (fit == pp.byFd.end()) {
         return std::nullopt;
     }
     const Fd ourFd = fit->second.ourFd;
-    pit->second.erase(fit);
-    // pid 的表空了顺手清理，避免 m_table 无限增长
-    if (pit->second.empty()) {
+    if (!fit->second.path.empty()) {
+        pp.byPath.erase(fit->second.path);
+    }
+    pp.byFd.erase(fit);
+    if (pp.byFd.empty()) {
+        m_table.erase(pit);
+    }
+    return ourFd;
+}
+
+std::optional<Fd> FdTable::unregisterByPath(i64 pid, std::string_view path)
+{
+    auto pit = m_table.find(pid);
+    if (pit == m_table.end()) {
+        return std::nullopt;
+    }
+    auto& pp = pit->second;
+    auto spit = pp.byPath.find(std::string{path});
+    if (spit == pp.byPath.end()) {
+        return std::nullopt;
+    }
+    const Fd origFd = spit->second;
+    pp.byPath.erase(spit);
+    auto fit = pp.byFd.find(origFd);
+    if (fit == pp.byFd.end()) {
+        return std::nullopt;
+    }
+    const Fd ourFd = fit->second.ourFd;
+    pp.byFd.erase(fit);
+    if (pp.byFd.empty()) {
         m_table.erase(pit);
     }
     return ourFd;
@@ -37,8 +74,25 @@ const FdEntry* FdTable::lookup(i64 pid, Fd origFd) const
     if (pit == m_table.end()) {
         return nullptr;
     }
-    auto fit = pit->second.find(origFd);
-    if (fit == pit->second.end()) {
+    auto fit = pit->second.byFd.find(origFd);
+    if (fit == pit->second.byFd.end()) {
+        return nullptr;
+    }
+    return &fit->second;
+}
+
+const FdEntry* FdTable::lookupByPath(i64 pid, std::string_view path) const
+{
+    auto pit = m_table.find(pid);
+    if (pit == m_table.end()) {
+        return nullptr;
+    }
+    auto spit = pit->second.byPath.find(std::string{path});
+    if (spit == pit->second.byPath.end()) {
+        return nullptr;
+    }
+    auto fit = pit->second.byFd.find(spit->second);
+    if (fit == pit->second.byFd.end()) {
         return nullptr;
     }
     return &fit->second;
@@ -52,8 +106,8 @@ void FdTable::closePid(i64 pid)
 size_t FdTable::size() const noexcept
 {
     size_t n = 0;
-    for (const auto& [_, inner] : m_table) {
-        n += inner.size();
+    for (const auto& [_, pp] : m_table) {
+        n += pp.byFd.size();
     }
     return n;
 }
