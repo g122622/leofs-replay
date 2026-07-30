@@ -11,9 +11,10 @@
 
 #ifndef _WIN32
 // ============================================================================
-// POSIX 实现：在 Linux/macOS 下真实执行 syscall。
-// 真实回放依赖 openat/read/write/rename 等 POSIX 接口，trace 本身是 Linux
-// bpftrace 产物，故在非 Windows 平台构建运行。
+// POSIX implementation: really executes syscalls on Linux/macOS.
+// Real replay depends on POSIX interfaces such as openat/read/write/rename; the
+// trace itself is a Linux bpftrace product, so it builds and runs on non-Windows
+// platforms.
 // ============================================================================
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -36,19 +37,23 @@ ExecOutcome skipped(std::string why)
     return ExecOutcome{true, true, std::move(why)};
 }
 
-/// 把 Linux open flags 映射为本进程可用的 open flags。
-/// 我们不需要精确复刻原始 flag，只需保证"以合理方式打开"以承接后续 IO。
+/// Map Linux open flags to open flags usable by this process.
+/// We do not need to faithfully reproduce the original flags; we only need to
+/// "open in a reasonable way" to carry subsequent IO.
 ///
-/// 真实 rawproc 输出（已验证）：openat 的 arg1 = flags（【十进制】整数），
-/// 例如 524288 = 0x80000 = O_CLOEXEC。这里按位解析这些 Linux 取值：
-///   访问模式低两位：O_RDONLY=0 O_WRONLY=1 O_RDWR=2
+/// Real rawproc output (verified): openat's arg1 = flags (a [decimal] integer),
+/// e.g. 524288 = 0x80000 = O_CLOEXEC. These Linux values are parsed bitwise
+/// here:
+///   access mode, low two bits: O_RDONLY=0 O_WRONLY=1 O_RDWR=2
 ///   O_CREAT  = 0100(0x40)   O_EXCL   = 0200(0x80)
 ///   O_TRUNC  = 01000(0x200) O_APPEND = 02000(0x400)
-///   O_CLOEXEC= 02000000(0x80000) —— 原始若有则保留语义（本进程一律加 CLOEXEC）
+///   O_CLOEXEC= 02000000(0x80000) — preserved if present (this process always
+///   adds CLOEXEC)
 int translateOpenFlags(i64 origFlags)
 {
-    int flags = O_CLOEXEC;   // 回放进程默认 close-on-exec，避免 fd 泄漏
-    // 访问模式取低两位
+    int flags = O_CLOEXEC;   // the replay process defaults to close-on-exec to
+                             // avoid fd leakage
+    // Access mode: take the low two bits
     switch (origFlags & 0x3) {
         case 0x1: flags |= O_WRONLY; break;
         case 0x2: flags |= O_RDWR;   break;
@@ -58,7 +63,7 @@ int translateOpenFlags(i64 origFlags)
     if (origFlags & 0x80)    flags |= O_EXCL;
     if (origFlags & 0x200)   flags |= O_TRUNC;
     if (origFlags & 0x400)   flags |= O_APPEND;
-    // O_CLOEXEC(0x80000)：本进程已默认带，无需额外处理
+    // O_CLOEXEC(0x80000): this process already has it by default; nothing extra
     return flags;
 }
 
@@ -95,53 +100,58 @@ Result<ExecOutcome> SyscallExecutor::execute(const TraceEvent& ev)
     if (ev.isRename()) {
         return doRename(ev);
     }
-    // getdents/utimensat/xattr 等暂不真实执行，标记跳过
-    return skipped(std::format("暂未实现的 syscall: {}", ev.sc));
+    // getdents/utimensat/xattr etc. are not yet executed for real; mark as
+    // skipped.
+    return skipped(std::format("not-yet-implemented syscall: {}", ev.sc));
 }
 
 Result<ExecOutcome> SyscallExecutor::doOpen(const TraceEvent& ev)
 {
-    // 解析沙箱内路径（含防穿越校验）
+    // Resolve the sandbox path (including traversal protection)
     TR_TRY(resolved, m_resolver.resolve(ev, m_fdTable));
 
-    // 真实 rawproc 输出：openat 的 arg1 = flags（十进制），arg2 = mode 之类。
-    // 故 flags 取自 arg1Num。
+    // Real rawproc output: openat's arg1 = flags (decimal), arg2 = mode etc.
+    // So flags come from arg1Num.
     const int flags = translateOpenFlags(ev.arg1Num);
     const mode_t mode = (flags & O_CREAT) ? 0644 : 0;
 
     int ourFd = ::open(resolved.c_str(), flags, mode);
     if (ourFd < 0) {
         const int e = errno;
-        // 原始 trace 若本次 open 本就失败（ret<0），则"复现失败"不算我们的错误
+        // If the original open itself failed (ret<0), "reproducing the failure"
+        // is not our error.
         if (ev.ret < 0) {
             return ExecOutcome{true, false,
-                std::format("open 复现原始失败: {} (errno={}, 原始 ret={})",
+                std::format("open reproduced original failure: {} (errno={}, orig ret={})",
                             resolved.string(), e, ev.ret)};
         }
         return Error::syscallError(
-            std::format("open 失败: {} : {}", resolved.string(), std::strerror(e)),
+            std::format("open failed: {} : {}", resolved.string(), std::strerror(e)),
             "SyscallExecutor::doOpen");
     }
 
     if (ev.ret >= 0) {
         struct stat st {};
         bool isDir = (::fstat(ourFd, &st) == 0) && S_ISDIR(st.st_mode);
-        // 登记时用 bestLookupPath（canonical_path 优先）作为反查键，与 IO/close 一致
+        // Register using bestLookupPath (canonical_path preferred) as the
+        // reverse-lookup key, consistent with IO/close.
         m_fdTable.registerFd(ev.pid, static_cast<Fd>(ev.ret), ourFd,
                              std::string{bestLookupPath(ev)}, isDir);
     } else {
-        // 原始失败但我们打开了：为保持 fd 表与原始一致，立即关闭我们的 fd
+        // Original failed but we opened it: to keep the fd table consistent with
+        // the original, close our fd immediately.
         ::close(ourFd);
     }
     return ExecOutcome{true, false,
-        std::format("open {} → ourFd={} (origFd={})", resolved.string(), ourFd, ev.ret)};
+        std::format("open {} -> ourFd={} (origFd={})", resolved.string(), ourFd, ev.ret)};
 }
 
 Result<ExecOutcome> SyscallExecutor::doIo(const TraceEvent& ev)
 {
-    // fd 跟踪改为 path 反查：read/write 的 arg1 是字节数 count，不是 fd。
-    // 优先用 bestLookupPath（canonical_path 优先，退化 path）在该 pid 下反查 ourFd；
-    // 若 path 为 "/[unknown, fd=N]" 形态，提取 N 走 fd 直查回退。
+    // fd tracking uses path reverse-lookup: read/write's arg1 is the byte count,
+    // not fd. Prefer bestLookupPath (canonical_path preferred, falling back to
+    // path) to reverse-look up ourFd under this pid; if path is in the
+    // "/[unknown, fd=N]" form, extract N and fall back to a direct fd lookup.
     const std::string_view lookupPath = bestLookupPath(ev);
     const FdEntry* e = nullptr;
     if (auto fd = extractUnknownFd(lookupPath)) {
@@ -150,12 +160,14 @@ Result<ExecOutcome> SyscallExecutor::doIo(const TraceEvent& ev)
         e = m_fdTable.lookupByPath(ev.pid, lookupPath);
     }
     if (!e) {
-        return skipped(std::format("IO 未找到 fd 映射: pid={} path=\"{}\"", ev.pid, lookupPath));
+        return skipped(std::format("IO fd mapping not found: pid={} path=\"{}\"", ev.pid, lookupPath));
     }
 
-    // 原始 ret = 实际读写字节数。复现"该 fd 上发生 N 字节 IO"的时间序列语义，
-    // 不复现数据内容（trace 无负载）。read 用零缓冲，write 写零字节占位。
-    // arg1Num = 请求字节数（pread64/pwrite64 的 offset 在 arg2Num）。
+    // Original ret = actual bytes read/written. Reproduce the time-series
+    // semantics of "N bytes of IO occurred on this fd"; do not reproduce data
+    // content (the trace has no payload). read uses a zero buffer, write writes
+    // zero bytes as a placeholder.
+    // arg1Num = requested byte count (pread64/pwrite64's offset is in arg2Num).
     const i64 wantBytes = ev.ret > 0 ? ev.ret : 0;
     const i64 ioLen = std::min(wantBytes, m_maxIoBytes);
     std::vector<char> buf(static_cast<size_t>(ioLen), 0);
@@ -178,12 +190,13 @@ Result<ExecOutcome> SyscallExecutor::doIo(const TraceEvent& ev)
         else                  ::writev(e->ourFd, &iov, 1);
     }
     return ExecOutcome{true, false,
-        std::format("{} {} 字节 via ourFd={} ({})", ev.sc, ioLen, e->ourFd, e->path)};
+        std::format("{} {} bytes via ourFd={} ({})", ev.sc, ioLen, e->ourFd, e->path)};
 }
 
 Result<ExecOutcome> SyscallExecutor::doClose(const TraceEvent& ev)
 {
-    // close 的 arg1/ret 均为 0，fd 信息不在 arg，同样靠 path 反查。
+    // close's arg1/ret are both 0; the fd info is not in any arg, so path
+    // reverse-lookup is used here too.
     const std::string_view lookupPath = bestLookupPath(ev);
     std::optional<Fd> ourFd;
     if (auto fd = extractUnknownFd(lookupPath)) {
@@ -192,12 +205,12 @@ Result<ExecOutcome> SyscallExecutor::doClose(const TraceEvent& ev)
         ourFd = m_fdTable.unregisterByPath(ev.pid, lookupPath);
     }
     if (!ourFd) {
-        return skipped(std::format("close 未找到 fd 映射: pid={} path=\"{}\"", ev.pid, lookupPath));
+        return skipped(std::format("close fd mapping not found: pid={} path=\"{}\"", ev.pid, lookupPath));
     }
     if (::close(*ourFd) < 0) {
         const int e = errno;
         return Error::syscallError(
-            std::format("close 失败: ourFd={} : {}", *ourFd, std::strerror(e)),
+            std::format("close failed: ourFd={} : {}", *ourFd, std::strerror(e)),
             "SyscallExecutor::doClose");
     }
     return ExecOutcome{true, false,
@@ -210,10 +223,10 @@ Result<ExecOutcome> SyscallExecutor::doStatLike(const TraceEvent& ev)
     struct stat st {};
     if (::stat(resolved.c_str(), &st) < 0) {
         const int e = errno;
-        return skipped(std::format("{} 目标不存在: {} (errno={})", ev.sc, resolved.string(), e));
+        return skipped(std::format("{} target does not exist: {} (errno={})", ev.sc, resolved.string(), e));
     }
     return ExecOutcome{true, false,
-        std::format("{} → {} (size={})", ev.sc, resolved.string(), st.st_size)};
+        std::format("{} -> {} (size={})", ev.sc, resolved.string(), st.st_size)};
 }
 
 Result<ExecOutcome> SyscallExecutor::doMkdir(const TraceEvent& ev)
@@ -222,13 +235,13 @@ Result<ExecOutcome> SyscallExecutor::doMkdir(const TraceEvent& ev)
     if (::mkdir(resolved.c_str(), 0755) < 0) {
         const int e = errno;
         if (e == EEXIST) {
-            return ExecOutcome{true, false, std::format("mkdir 已存在: {}", resolved.string())};
+            return ExecOutcome{true, false, std::format("mkdir already exists: {}", resolved.string())};
         }
         return Error::syscallError(
-            std::format("mkdir 失败: {} : {}", resolved.string(), std::strerror(e)),
+            std::format("mkdir failed: {} : {}", resolved.string(), std::strerror(e)),
             "SyscallExecutor::doMkdir");
     }
-    return ExecOutcome{true, false, std::format("mkdir → {}", resolved.string())};
+    return ExecOutcome{true, false, std::format("mkdir -> {}", resolved.string())};
 }
 
 Result<ExecOutcome> SyscallExecutor::doUnlink(const TraceEvent& ev)
@@ -237,19 +250,20 @@ Result<ExecOutcome> SyscallExecutor::doUnlink(const TraceEvent& ev)
     if (::unlink(resolved.c_str()) < 0) {
         const int e = errno;
         if (e == ENOENT) {
-            return skipped(std::format("unlink 目标不存在: {}", resolved.string()));
+            return skipped(std::format("unlink target does not exist: {}", resolved.string()));
         }
         return Error::syscallError(
-            std::format("unlink 失败: {} : {}", resolved.string(), std::strerror(e)),
+            std::format("unlink failed: {} : {}", resolved.string(), std::strerror(e)),
             "SyscallExecutor::doUnlink");
     }
-    return ExecOutcome{true, false, std::format("unlink → {}", resolved.string())};
+    return ExecOutcome{true, false, std::format("unlink -> {}", resolved.string())};
 }
 
 Result<ExecOutcome> SyscallExecutor::doRename(const TraceEvent& ev)
 {
-    // rename 需解析源与目标两个路径。PathResolver::resolve 默认取目标侧，
-    // 这里单独解析源侧（用 renameSrc）。
+    // rename needs to resolve both the source and target paths.
+    // PathResolver::resolve defaults to the target side; here we resolve the
+    // source side separately (using renameSrc).
     TraceEvent srcEv = ev;
     srcEv.path = ev.renameSrc;
     srcEv.renameDst.clear();
@@ -262,10 +276,10 @@ Result<ExecOutcome> SyscallExecutor::doRename(const TraceEvent& ev)
     if (::rename(srcResolved.c_str(), dstResolved.c_str()) < 0) {
         const int e = errno;
         if (e == ENOENT) {
-            return skipped(std::format("rename 源不存在: {}", srcResolved.string()));
+            return skipped(std::format("rename source does not exist: {}", srcResolved.string()));
         }
         return Error::syscallError(
-            std::format("rename 失败: {} -> {} : {}",
+            std::format("rename failed: {} -> {} : {}",
                         srcResolved.string(), dstResolved.string(), std::strerror(e)),
             "SyscallExecutor::doRename");
     }
@@ -275,12 +289,14 @@ Result<ExecOutcome> SyscallExecutor::doRename(const TraceEvent& ev)
 
 #else
 // ============================================================================
-// Windows 占位实现
+// Windows placeholder implementation
 //
-// 真实 syscall 回放依赖 POSIX 接口（openat/pread64/rename...），在 Windows 上
-// 无对应物。Windows 构建仅用于校验解析、排序、fd 表、路径解析等跨平台逻辑
-// （DryRunExecutor 路径）。SyscallExecutor 在 Windows 下构造合法但 execute
-// 一律返回"平台不支持"，保证整体可编译、可链接。
+// Real syscall replay depends on POSIX interfaces (openat/pread64/rename...),
+// which have no counterpart on Windows. The Windows build is only used to
+// verify cross-platform logic such as parsing, sorting, the fd table, and path
+// resolution (the DryRunExecutor path). On Windows, SyscallExecutor constructs
+// legally but execute always returns "platform not supported", so the whole
+// thing still compiles and links.
 // ============================================================================
 
 namespace trace_replay {
@@ -294,9 +310,10 @@ SyscallExecutor::SyscallExecutor(std::filesystem::path sandboxRoot, i64 maxIoByt
 
 Result<ExecOutcome> SyscallExecutor::execute(const TraceEvent& ev)
 {
-    // 真实 syscall 回放仅在 POSIX 平台可用；Windows 下标记跳过
+    // Real syscall replay is only available on POSIX platforms; on Windows it
+    // is marked as skipped.
     (void)ev;
-    return ExecOutcome{true, true, "Windows 平台不支持真实 syscall 回放，请用 DryRunExecutor"};
+    return ExecOutcome{true, true, "real syscall replay is not supported on Windows; use DryRunExecutor"};
 }
 
 #endif  // _WIN32

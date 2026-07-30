@@ -6,7 +6,7 @@
 namespace trace_replay {
 namespace {
 
-// 忠实移植 rawproc 的 PATH_OPS（见 context.md 第 102-107 行）
+// Faithfully ported from rawproc's PATH_OPS (see context.md lines 102-107)
 constexpr std::array PATH_OPS = {
     std::string_view{"newfstatat"}, std::string_view{"statx"},
     std::string_view{"stat"},       std::string_view{"lstat"},
@@ -23,20 +23,21 @@ constexpr std::array PATH_OPS = {
     std::string_view{"linkat"},     std::string_view{"symlinkat"},
 };
 
-// 忠实移植 rawproc 的 IO_OPS（见 context.md 第 108 行）
+// Faithfully ported from rawproc's IO_OPS (see context.md line 108)
 constexpr std::array IO_OPS = {
     std::string_view{"read"},   std::string_view{"write"},
     std::string_view{"pread64"}, std::string_view{"pwrite64"},
     std::string_view{"readv"},  std::string_view{"writev"},
 };
 
-// 忠实移植 rawproc 的 RENAME_SC（见 context.md 第 116 行）
+// Faithfully ported from rawproc's RENAME_SC (see context.md line 116)
 constexpr std::array RENAME_SC = {
     std::string_view{"renameat"}, std::string_view{"renameat2"},
     std::string_view{"rename"},
 };
 
-// 需要真实打开文件、向 fd 表登记映射的操作
+// Operations that need to really open a file and register a mapping in the fd
+// table.
 constexpr std::array OPEN_SC = {
     std::string_view{"openat"}, std::string_view{"openat2"},
     std::string_view{"open"},

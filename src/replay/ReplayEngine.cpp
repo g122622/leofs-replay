@@ -18,14 +18,14 @@ ReplayEngine::ReplayEngine(ReplayConfig cfg,
 
 bool ReplayEngine::passesFilter(const TraceEvent& ev) const noexcept
 {
-    // pid 过滤
+    // pid filter
     if (!m_cfg.pidFilter.empty()) {
         if (std::find(m_cfg.pidFilter.begin(), m_cfg.pidFilter.end(), ev.pid)
             == m_cfg.pidFilter.end()) {
             return false;
         }
     }
-    // side 过滤（Other 表示不过滤）
+    // side filter (Other means no filtering)
     if (m_cfg.sideFilter != Side::Other && ev.side != m_cfg.sideFilter) {
         return false;
     }
@@ -35,7 +35,7 @@ bool ReplayEngine::passesFilter(const TraceEvent& ev) const noexcept
 Result<ReplayStats> ReplayEngine::run()
 {
     TR_TRY_VOID(m_merger.open(m_cfg));
-    m_log << std::format("[engine] 已打开 {} 个桶\n", m_merger.readerCount());
+    m_log << std::format("[engine] opened {} buckets\n", m_merger.readerCount());
 
     ReplayStats stats;
     bool first = true;
@@ -59,21 +59,22 @@ Result<ReplayStats> ReplayEngine::run()
             continue;
         }
 
-        // 事件上限（有界 dry-run）：达到即停，不再处理后续事件
+        // Event cap (bounded dry-run): stop once reached; do not process further
+        // events.
         if (m_cfg.maxEvents > 0 && stats.processed + stats.failed >= m_cfg.maxEvents) {
-            m_log << std::format("[engine] 达到 max_events 上限 {}，停止回放\n",
+            m_log << std::format("[engine] reached max_events cap {}, stopping replay\n",
                                  m_cfg.maxEvents);
             break;
         }
 
-        // 节拍：按原始时间分布插入等待
+        // Pacing: insert a wait according to the original time distribution
         m_pacer.pace(ev.machineTs);
 
-        // 执行（可能成功/skipped/失败）
+        // Execute (may succeed / be skipped / fail)
         auto execRes = m_executor->execute(ev);
         if (!execRes.success()) {
             ++stats.failed;
-            m_log << std::format("[engine] 事件执行失败 @ts={:.6f} pid={} {}: {}\n",
+            m_log << std::format("[engine] event execution failed @ts={:.6f} pid={} {}: {}\n",
                                  ev.machineTs, ev.pid, ev.sc,
                                  execRes.error().toString());
             if (!m_cfg.continueOnError) {
@@ -87,11 +88,12 @@ Result<ReplayStats> ReplayEngine::run()
         }
     }
 
-    // processed 在循环内累加（通过过滤且执行未抛错的次数）；
-    // skipped 是其中被执行器判定为跳过的子集。
+    // processed is accumulated in the loop (the count of events that passed the
+    // filter and did not throw on execution);
+    // skipped is the subset of those the executor judged as skipped.
     m_log << std::format(
-        "[engine] 回放完成: total={} processed={} skipped={} failed={} filtered={} "
-        "ts范围=[{:.6f}, {:.6f}] fd表残留={}\n",
+        "[engine] replay done: total={} processed={} skipped={} failed={} filtered={} "
+        "ts range=[{:.6f}, {:.6f}] fd table residual={}\n",
         stats.totalEvents, stats.processed, stats.skipped, stats.failed,
         stats.filtered, stats.firstTs, stats.lastTs, m_executor->fdTable().size());
 

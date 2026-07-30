@@ -1,196 +1,196 @@
-# trace-replay 项目介绍
+# trace-replay Project Overview
 
-> 按时间序列回放 rawproc 排序后的 Parquet trace 事件流，在受限沙箱内真实执行 syscall，以还原存储迁移工作负载的时序行为。
-
----
-
-## 1. 背景与动机
-
-存储迁移期间，源端文件系统上的真实工作负载（文件读写、元数据操作）被 `bpftrace` 采集，经 `rawproc`（`rawproc_spark.py`）解析、挂载映射并按时间分桶排序，产出 `events_tsorted/bucket=NNNNNN` 形态的 Parquet 数据集。`rawproc` 的职责止于"解析与排序"，它**不接触 fd**，也不执行任何 syscall。
-
-本项目（对应 context.md 中的 **openat-replay**）消费 `rawproc` 的输出，完成最后一环：把已排序的离散事件流**还原为可执行的时间序列**，在隔离沙箱中逐条重放，从而
-
-* 评估迁移目标端在真实负载时序下的吞吐与延迟；
-* 校验 fd 生命周期、路径访问模式是否与原始 trace 一致；
-* 在不依赖原始数据内容的前提下，复现"某 fd 上发生 N 字节 IO"的**时间序列语义**。
-
-核心设计原则：**以 fd 为准，而非 path。**
+> Replays the event stream of a rawproc-sorted Parquet trace in time-series order, executing real syscalls inside a restricted sandbox to reproduce the timing behavior of a storage-migration workload.
 
 ---
 
-## 2. 与 rawproc 的分工
+## 1. Background and motivation
 
-| 阶段 | 职责 | 是否涉及 fd |
+During a storage migration, the real workload on the source filesystem (file reads/writes, metadata operations) is captured by `bpftrace`, then parsed, mount-mapped, time-bucketed, and sorted by `rawproc` (`rawproc_spark.py`), producing a Parquet dataset of the form `events_tsorted/bucket=NNNNNN`. `rawproc`'s responsibility stops at "parse and sort": it **does not touch fd** and executes no syscalls.
+
+This project (corresponding to **openat-replay** in context.md) consumes `rawproc`'s output and completes the final stage: **restoring the sorted, discrete event stream into an executable time series**, replaying each event one by one in an isolated sandbox, in order to:
+
+* evaluate the throughput and latency of the migration target under the real load timing;
+* verify that fd lifecycles and path access patterns are consistent with the original trace;
+* reproduce the **time-series semantics** of "N bytes of IO occurred on some fd" without depending on the original data content.
+
+Core design principle: **fd takes precedence over path.**
+
+---
+
+## 2. Division of labor with rawproc
+
+| Stage | Responsibility | Touches fd? |
 |---|---|---|
-| `bpftrace` 采集 | 抓取 syscall 入口/出口参数 | 否 |
-| `rawproc` 解析 | 行正则、挂载映射、`floor(machine_ts/600)` 分桶、按 `(machine_ts, log_offset)` 排序 | 否 |
-| **trace-replay** | 全局时间序归并、fd 表维护、路径防穿越、真实 syscall 执行 | **是** |
+| `bpftrace` capture | grab syscall entry/exit arguments | No |
+| `rawproc` parsing | line regex, mount mapping, `floor(machine_ts/600)` bucketing, sort by `(machine_ts, log_offset)` | No |
+| **trace-replay** | global time-ordered merge, fd table maintenance, path traversal protection, real syscall execution | **Yes** |
 
-`rawproc` 排序保证两条不变量：桶间全局有序、无重叠；桶内按 `(machine_ts, log_offset)` 有序。本项目正是利用这一不变量，将分桶输出重新归并为单一全局时间序。
+`rawproc` sorting guarantees two invariants: buckets are globally ordered and non-overlapping; within a bucket, events are ordered by `(machine_ts, log_offset)`. This project exploits that invariant to re-merge the bucketed output into a single global time order.
 
 ---
 
-## 3. 系统架构
+## 3. System architecture
 
 ```mermaid
 flowchart TD
-    A["rawproc 排序 Parquet<br/>bucket=NNNNNN / 单文件"] --> R["ParquetEventReader<br/>流式读取, 列映射 EVENT_COLS"]
-    R --> M["EventMerger<br/>K 路小顶堆归并<br/>键 (machine_ts, log_offset)"]
+    A["rawproc sorted Parquet<br/>bucket=NNNNNN / single file"] --> R["ParquetEventReader<br/>streaming read, column mapping EVENT_COLS"]
+    R --> M["EventMerger<br/>K-way min-heap merge<br/>key (machine_ts, log_offset)"]
     M --> E["ReplayEngine"]
-    E --> F["过滤器 pid / side"]
+    E --> F["filter pid / side"]
     F --> P["TimePacer<br/>fast · real · scaled"]
     P --> X{"dry_run?"}
-    X -->|true| D["DryRunExecutor<br/>推演 fd 表 + 打印"]
-    X -->|false| S["SyscallExecutor<br/>沙箱真实 syscall (POSIX)"]
-    D --> M1["FdTable + PathResolver<br/>(路径防穿越)"]
+    X -->|true| D["DryRunExecutor<br/>simulate fd table + print"]
+    X -->|false| S["SyscallExecutor<br/>real syscalls in sandbox (POSIX)"]
+    D --> M1["FdTable + PathResolver<br/>(path traversal protection)"]
     S --> M1
-    M1 --> OUT["统计: total · processed · skipped · failed"]
+    M1 --> OUT["stats: total · processed · skipped · failed"]
 ```
 
-### 3.1 输入层：ParquetEventReader
+### 3.1 Input layer: ParquetEventReader
 
-兼容两种输入形态：
+Compatible with two input forms:
 
-1. **分桶目录**（rawproc 标准产出）：枚举 `events_tsorted/bucket=NNNNNN` 下的 `.parquet` part 文件，合并为单表后顺序吐出；
-2. **单文件直读**：当 `events_root` 直接指向一个 `.parquet` 文件时绕过分桶逻辑，单 reader 直读。适用于用户提供的扁平 part 文件（已全局排序），此时归并器 K 路堆退化为直通。
+1. **Bucketed directory** (standard rawproc output): enumerate the `.parquet` part files under `events_tsorted/bucket=NNNNNN`, merge them into a single table, and emit events in order.
+2. **Single-file direct read**: when `events_root` points directly to a `.parquet` file, the bucketing logic is bypassed and a single reader reads it directly. This suits a flat part file supplied by the user (already globally sorted); here the merger's K-way heap degenerates to a passthrough.
 
-读取器按 `rawproc` 的 `EVENT_COLS` 列名映射，并把 `ret`/`err`/`arg1`/`arg2` 这些**十进制字符串列**解析为数值。`string_view` 字段指向 Arrow 内部缓冲，在 Table 存活期内稳定。
+The reader maps columns according to rawproc's `EVENT_COLS` names, and parses the `ret`/`err`/`arg1`/`arg2` **decimal-string columns** into numeric values. `string_view` fields point into Arrow's internal buffers and stay valid for the lifetime of the Table.
 
-### 3.2 归并层：EventMerger
+### 3.2 Merge layer: EventMerger
 
-为每个桶创建一个 `ParquetEventReader`，再做 **K 路小顶堆归并**。堆节点比较键为 `(machine_ts, log_offset)`——与 `rawproc` 排序键一致，保证全局稳定。这便是 replay 时间序列的来源。
+Creates one `ParquetEventReader` per bucket and then performs a **K-way min-heap merge**. The heap node comparison key is `(machine_ts, log_offset)` — identical to rawproc's sort key, ensuring global stability. This is the source of the replay time series.
 
-### 3.3 引擎层：ReplayEngine
+### 3.3 Engine layer: ReplayEngine
 
-编排"归并 → 过滤 → 节拍 → 执行"四阶段，并维护运行统计：
+Orchestrates the four stages "merge → filter → pace → execute" and maintains run statistics:
 
-* **过滤器**：按 `pid_filter` 与 `side_filter`（source/target/all）裁剪事件流；
-* **TimePacer**：三种节拍模式
-  * `fast`——不 sleep，尽快按时间序处理（默认，关注正确性与吞吐）；
-  * `real`——按原始事件间墙钟间隔 1:1 还原真实时间分布；
-  * `scaled`——按 `speed` 倍速缩放间隔。
+* **Filter**: trims the event stream by `pid_filter` and `side_filter` (source/target/all);
+* **TimePacer**: three pacing modes
+  * `fast` — no sleep, process in time order as fast as possible (default; focuses on correctness and throughput);
+  * `real` — reproduce the real-time distribution 1:1 by sleeping the original wall-clock gaps between events;
+  * `scaled` — scale the gaps by the `speed` multiplier.
 
-### 3.4 执行层：IExecutor 双实现
+### 3.4 Execution layer: IExecutor dual implementation
 
-| 执行器 | 行为 | 适用 |
+| Executor | Behavior | Use case |
 |---|---|---|
-| `DryRunExecutor` | 不执行真实 syscall，仅推演 fd 表与路径并打印每条事件 | 校验解析/排序/fd 映射逻辑，安全可重复 |
-| `SyscallExecutor` | 在沙箱内真实执行 `openat`/`read`/`write`/`rename` 等 | 真实回放（仅 POSIX 平台）|
+| `DryRunExecutor` | does not execute real syscalls; only simulates the fd table and paths, and prints each event | verifying parse/sort/fd-mapping logic; safe and repeatable |
+| `SyscallExecutor` | actually executes `openat`/`read`/`write`/`rename` etc. inside the sandbox | real replay (POSIX platforms only) |
 
-`SyscallExecutor` 复现的是**时间序列语义**而非数据内容：trace 不含数据负载，故 `read` 用零缓冲、`write` 写零字节占位，目的是还原"该 fd 上发生 N 字节 IO"的时序与 fd 生命周期。
+`SyscallExecutor` reproduces **time-series semantics**, not data content: the trace carries no data payload, so `read` uses a zero buffer and `write` writes zero bytes as a placeholder. The goal is to reproduce the timing and fd lifecycle of "N bytes of IO occurred on this fd".
 
 ---
 
-## 4. fd 跟踪策略
+## 4. fd tracking strategy
 
-这是本项目的技术核心。真实数据验证表明，`rawproc` 输出中各列语义如下：
+This is the technical core of the project. Real-data verification shows that in rawproc's output each column has the following semantics:
 
-| syscall | `ret` | `arg1` | `arg2` | fd 获取方式 |
+| syscall | `ret` | `arg1` | `arg2` | how fd is obtained |
 |---|---|---|---|---|
-| `openat` | **原始 fd**（成功时小整数）| flags（十进制，如 `524288`=O_CLOEXEC）| mode | 以 `ret` 建表 |
-| `read`/`write` | 实际字节数 | 请求字节数 count（**非 fd**）| — | path 反查 |
-| `pread64`/`pwrite64` | 实际字节数 | count | offset | path 反查 |
-| `close` | 0 | 0 | 0 | path 反查 |
+| `openat` | **original fd** (a small integer on success) | flags (decimal, e.g. `524288`=O_CLOEXEC) | mode | build the table from `ret` |
+| `read`/`write` | actual byte count | requested byte count (**not fd**) | — | reverse-lookup by path |
+| `pread64`/`pwrite64` | actual byte count | count | offset | reverse-lookup by path |
+| `close` | 0 | 0 | 0 | reverse-lookup by path |
 
-关键结论：**IO 类操作的 fd 不在任何 arg 列中**（`arg1` 是字节数），只能通过 `path`/`canonical_path` 反查。绝大多数 IO 的 `path` 已解析为完整路径，少数为 `/[unknown, fd=N]` 形态。
+Key conclusion: **the fd of an IO operation is not in any arg column** (`arg1` is a byte count); it can only be reverse-looked up via `path`/`canonical_path`. For the vast majority of IO events `path` is already resolved to a full path; a few are in the form `/[unknown, fd=N]`.
 
 ```mermaid
 flowchart TD
-    EV["时间序事件"] --> C{syscall}
-    C -->|openat 成功| O["origFd ← ret<br/>flags ← arg1 (十进制)"]
-    O --> RG["registerFd(pid, origFd, ourFd, path)<br/>byFd ∪ byPath 双索引"]
+    EV["time-ordered event"] --> C{syscall}
+    C -->|openat success| O["origFd ← ret<br/>flags ← arg1 (decimal)"]
+    O --> RG["registerFd(pid, origFd, ourFd, path)<br/>byFd ∪ byPath dual index"]
     C -->|read / write| I["lookupPath ← canonical_path ∣ path"]
-    I --> K{path 形态}
+    I --> K{path form}
     K -->|"/[unknown, fd=N]"| L1["lookup(pid, N)"]
-    K -->|已解析| L2["lookupByPath(pid, path)"]
-    L1 --> H{命中 ourFd?}
+    K -->|resolved| L2["lookupByPath(pid, path)"]
+    L1 --> H{hit ourFd?}
     L2 --> H
-    H -->|是| IO["执行 IO, 字节数 = ret"]
-    H -->|否| SK["skip: fd 未映射"]
-    C -->|close| CL["lookupPath 同上"]
-    CL --> U["unregister(byFd ∣ byPath)<br/>关闭并回收 ourFd"]
+    H -->|yes| IO["perform IO, byte count = ret"]
+    H -->|no| SK["skip: fd not mapped"]
+    C -->|close| CL["lookupPath same as above"]
+    CL --> U["unregister(byFd ∣ byPath)<br/>close and reclaim ourFd"]
 ```
 
-策略要点：
+Strategy points:
 
-* **openat 建表**：成功时以 `(pid, origFd=ret)` 为键登记，记录本回放进程真实打开得到的 `ourFd` 与 `path`。flags 取 `arg1`，经 `translateOpenFlags` 按位映射访问模式与 `O_CREAT`/`O_TRUNC`/`O_APPEND`/`O_CLOEXEC` 等。
-* **IO/close 反查**：以 `bestLookupPath(ev)`（`canonical_path` 优先，退化 `path`）在该 pid 的 fd 表中反查 `ourFd`；对 `/[unknown, fd=N]` 形态从串中提取 N，回退为 fd 直查。
-* **双索引同步**：`FdTable` 维护 `byFd`（origFd→entry）与 `byPath`（canonicalPath→origFd）两张索引，open 注册、close 注销时同步更新，允许同一路径被多次打开（多 fd 指向同路径，取最近登记者）。
-
----
-
-## 5. 路径解析与安全
-
-`PathResolver` 将原始 trace 路径解析为"沙箱内绝对路径"并强制**防穿越校验**（对齐 Cubium 规范：验证外部输入、防止路径遍历）：
-
-1. 优先用 `canonical_path`（rawproc 已映射到统一 CAPFS 命名空间）；`mapped=false` 或为空时退化用 `path`。
-2. 以 `/` 开头视为绝对路径，拼到 `sandboxRoot` 下；否则视为相对路径，需 `dirfd`（`AT_FDCWD=-100` 相对沙箱根，否则查 fd 表得目录路径再拼）。
-3. `weakly_canonical` 规范化后断言结果仍在 `sandboxRoot` 之下，否则拒绝执行该事件。
+* **openat builds the table**: on success, register under the key `(pid, origFd=ret)`, recording the `ourFd` actually opened by this replay process and the `path`. flags come from `arg1` and are bitwise-mapped via `translateOpenFlags` into an access mode plus `O_CREAT`/`O_TRUNC`/`O_APPEND`/`O_CLOEXEC`, etc.
+* **IO/close reverse-lookup**: use `bestLookupPath(ev)` (`canonical_path` preferred, falling back to `path`) to reverse-look up `ourFd` in that pid's fd table; for the `/[unknown, fd=N]` form, extract N from the string and fall back to a direct fd lookup.
+* **Dual-index synchronization**: `FdTable` maintains two indices — `byFd` (origFd→entry) and `byPath` (canonicalPath→origFd) — updated in sync on open registration and close unregistration. The same path may be opened multiple times (multiple fds pointing to the same path); the most recently registered one is taken.
 
 ---
 
-## 6. 配置
+## 5. Path resolution and security
 
-运行参数集中于一个 JSON 配置文件，命令行用法：`trace_replay <config.json>`。
+`PathResolver` resolves the original trace path into an "absolute path inside the sandbox" and enforces **path-traversal protection** (aligned with the Cubium spec: validate external input, prevent path traversal):
 
-| 字段 | 含义 | 默认 |
+1. Prefer `canonical_path` (rawproc already maps it into a unified CAPFS namespace); fall back to `path` when `mapped=false` or it is empty.
+2. A leading `/` is treated as an absolute path, appended under `sandboxRoot`; otherwise it is a relative path and needs a `dirfd` (`AT_FDCWD=-100` means relative to the sandbox root; otherwise look up the directory path via the fd table and append).
+3. After `weakly_canonical` normalization, assert the result is still under `sandboxRoot`; otherwise refuse to execute that event.
+
+---
+
+## 6. Configuration
+
+Run parameters are consolidated in a single JSON config file; command-line usage: `trace_replay <config.json>`.
+
+| Field | Meaning | Default |
 |---|---|---|
-| `events_root` | rawproc 产出根目录，或直接指向单个 `.parquet` 文件 | — |
-| `sandbox_root` | 真实 syscall 根目录，所有路径强制落其下 | — |
-| `bucket_min` / `bucket_max` | 只回放该桶编号范围（闭区间，`-1` 无上限）| `0` / `-1` |
+| `events_root` | rawproc output root directory, or a direct pointer to a single `.parquet` file | — |
+| `sandbox_root` | root directory for real syscalls; all paths are forced under it | — |
+| `bucket_min` / `bucket_max` | only replay this bucket-number range (closed interval; `-1` = no upper bound) | `0` / `-1` |
 | `pace_mode` | `fast` / `real` / `scaled` | `fast` |
-| `speed` | `scaled` 模式倍速 | `1.0` |
+| `speed` | speed multiplier for `scaled` mode | `1.0` |
 | `side_filter` | `all` / `source` / `target` | `all` |
-| `pid_filter` | 只回放这些 pid（空=全部）| `[]` |
-| `skip_unparsed` | 是否跳过 `_unparsed`/`null_ts` 桶 | `true` |
-| `dry_run` | `true`=仅推演不执行 syscall | `false` |
-| `max_io_bytes` | 单次 IO 上限 | `1048576` |
-| `continue_on_error` | syscall 失败时是否继续 | `true` |
-| `max_events` | 回放事件上限（`0`=不限，便于有界 dry-run）| `0` |
+| `pid_filter` | only replay these pids (empty = all) | `[]` |
+| `skip_unparsed` | whether to skip `_unparsed`/`null_ts` buckets | `true` |
+| `dry_run` | `true` = simulate only, do not execute syscalls | `false` |
+| `max_io_bytes` | per-IO upper bound | `1048576` |
+| `continue_on_error` | whether to continue on syscall failure | `true` |
+| `max_events` | replay event cap (`0` = unlimited; useful for bounded dry-run) | `0` |
 
 ---
 
-## 7. 构建
+## 7. Build
 
-C++20，依赖 Apache Arrow（含 Parquet）与 nlohmann_json，经 vcpkg manifest 模式自动安装。Windows 下使用 clang++（GNU 风格）+ Ninja Multi-Config，需先注入 VS 开发环境（本机 VS 预览版不被 `vswhere` 识别，vcpkg 依赖 `cl.exe` 定位工具链）。
+C++20, depends on Apache Arrow (with Parquet) and nlohmann_json, auto-installed via vcpkg manifest mode. On Windows, use clang++ (GNU-style) + Ninja Multi-Config; the VS development environment must be injected first (the VS Preview on this machine is not recognized by `vswhere`, and vcpkg relies on `cl.exe` to locate the toolchain).
 
 ```bat
-scripts\configure.bat          :: 仅配置
-scripts\configure.bat build    :: 配置 + 构建
+scripts\configure.bat          :: configure only
+scripts\configure.bat build    :: configure + build
 ```
 
-产物为 `build/bin/{Debug,Release}/trace_replay.exe`，依赖的 Arrow/Parquet DLL 由 vcpkg 自动部署到同目录。
+The output is `build/bin/{Debug,Release}/trace_replay.exe`; the dependent Arrow/Parquet DLLs are automatically deployed by vcpkg to the same directory.
 
-> `SyscallExecutor` 依赖 POSIX（`openat`/`pread64`/`rename`…），仅 Linux 构建可真实回放；Windows 下为占位实现，仅 `DryRunExecutor` 与解析层可运行。
+> `SyscallExecutor` depends on POSIX (`openat`/`pread64`/`rename`…); only the Linux build can perform real replay. On Windows it is a placeholder implementation; only `DryRunExecutor` and the resolution layer can run.
 
 ---
 
-## 8. 验证
+## 8. Verification
 
-在真实迁移 trace（340 MB，约 1746 万行）上以 `DryRunExecutor` 做有界 dry-run（`max_events=200000`）：
+A bounded dry-run (`max_events=200000`) was performed with `DryRunExecutor` on a real migration trace (340 MB, ~17.46 million lines):
 
-| 指标 | 值 |
+| Metric | Value |
 |---|---|
-| 处理事件 | 200000 |
-| 跳过（fd 未映射）| 23705（11.9%）|
-| 失败（路径穿越等）| 0 |
-| 时间范围 | ts ∈ [5082000.000019, 5082005.585218] |
-| syscall 分布 | read 193414 / newfstatat 2192 / openat 2183 / close 2182 / write 26 |
+| Events processed | 200000 |
+| Skipped (fd not mapped) | 23705 (11.9%) |
+| Failed (path traversal, etc.) | 0 |
+| Time range | ts ∈ [5082000.000019, 5082005.585218] |
+| syscall distribution | read 193414 / newfstatat 2192 / openat 2183 / close 2182 / write 26 |
 
-跳过率随回放窗口增大而下降（5k 窗口 45.6% → 200k 窗口 11.9%），证实跳过主要源于回放起点之前已打开的 fd 上的 read，属合理的边界效应；`failed=0` 表明路径防穿越校验无误杀。逐 fd 抽样验证：`openat ret=23` 建表后，同 path 的后续 `read` 经 `lookupByPath` 正确解析到 `ourFd=23`，未被跳过。
-
----
-
-## 9. 已知 TODO
-
-* `dup`/`dup2`/`dup3`、`exit(group)` 对 fd 表的影响尚未覆盖；
-* `getdents`/`utimensat`/xattr 等暂未真实执行（标记 skipped）；
-* 单元测试框架尚未接入（`TR_TRACE_REPLAY_BUILD_TESTS` 占位）；
-* Windows 下 `SyscallExecutor` 为占位实现，真实回放需移植到 Win32 API。
+The skip rate drops as the replay window grows (45.6% at a 5k window → 11.9% at a 200k window), confirming that skips are mainly reads on fds opened before the replay start point — a reasonable boundary effect; `failed=0` shows the path-traversal check produces no false positives. Per-fd sampling verification: after `openat ret=23` built the table, subsequent `read` on the same path correctly resolved to `ourFd=23` via `lookupByPath` and was not skipped.
 
 ---
 
-## 附：目录结构
+## 9. Known TODOs
+
+* The effects of `dup`/`dup2`/`dup3` and `exit(group)` on the fd table are not yet covered;
+* `getdents`/`utimensat`/xattr etc. are not yet executed for real (marked as skipped);
+* The unit test framework is not yet wired up (`TR_TRACE_REPLAY_BUILD_TESTS` placeholder);
+* On Windows, `SyscallExecutor` is a placeholder implementation; real replay requires porting to the Win32 API.
+
+---
+
+## Appendix: directory structure
 
 ```
 trace-replay/
@@ -203,6 +203,6 @@ trace-replay/
 │   ├── io/      IEventReader · ParquetEventReader · EventMerger
 │   ├── model/   FdTable · PathResolver
 │   └── replay/  IExecutor · TimePacer · DryRunExecutor · SyscallExecutor · ReplayEngine
-├── src/         （与 include 一一对应的 .cpp + main.cpp）
+├── src/         (.cpp files one-to-one with include + main.cpp)
 └── README.md
 ```

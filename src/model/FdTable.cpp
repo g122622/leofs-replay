@@ -10,7 +10,8 @@ void FdTable::registerFd(i64 pid, Fd origFd, Fd ourFd,
     TR_ASSERT(origFd >= 0);
     TR_ASSERT(ourFd >= 0);
     auto& pp = m_table[pid];
-    // 若该 origFd 已存在（fd 复用），先从 path 索引移除旧 path 指向
+    // If this origFd already exists (fd reuse), first remove the old path's
+    // pointer from the path index.
     auto it = pp.byFd.find(origFd);
     if (it != pp.byFd.end() && !it->second.path.empty()) {
         pp.byPath.erase(it->second.path);

@@ -1,5 +1,5 @@
 {
-  "_comment": "Dry-run 示例配置。把 events_root 指向单个 .parquet 文件（单文件直读模式）或 rawproc 产出根目录（分桶模式）。max_events>0 可做有界 dry-run。",
+  "_comment": "Dry-run example config. Point events_root at a single .parquet file (single-file direct-read mode) or at the rawproc output root (bucketed mode). Setting max_events>0 gives a bounded dry-run.",
   "events_root": "F:/下载/part-00000-da602166-a28b-46d4-9cd2-96c7e94b928a-c000.zstd.parquet",
   "sandbox_root": "E:/dev/leofs/trace-replay/build/sandbox",
 

@@ -1,12 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
 
 # ============================================================================
-# vcpkg 集成（必须在 project() 之前）
+# vcpkg integration (must come before project())
 #
-# 与参考项目（Cubium）一致的写法：若环境提供 VCPKG_ROOT 则自动接入 vcpkg
-# 工具链，从而在 manifest 模式下自动安装 arrow / nlohmann-json。
-# 注意：Windows 上需先经 VsDevCmd.bat 注入 VS 开发环境，使 cl.exe 进入 PATH，
-# 否则 vcpkg 无法定位 VS 实例（本机的 VS 18 预览版不被 vswhere 识别）。
+# Same approach as the reference project (Cubium): if the environment provides
+# VCPKG_ROOT, automatically wire up the vcpkg toolchain so that arrow /
+# nlohmann-json are auto-installed in manifest mode.
+# Note: on Windows the VS development environment must be injected first via
+# VsDevCmd.bat so that cl.exe is on PATH; otherwise vcpkg cannot locate the VS
+# instance (the VS 18 Preview on this machine is not recognized by vswhere).
 # ============================================================================
 if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
@@ -17,14 +19,18 @@ elseif(EXISTS "E:/vcpkg/scripts/buildsystems/vcpkg.cmake" AND NOT DEFINED CMAKE_
 endif()
 
 # ============================================================================
-# trace-replay —— 按时间序列回放 rawproc 排序后 Parquet trace 的事件流
+# trace-replay — replays the event stream of a rawproc-sorted Parquet trace in
+# time-series order.
 #
-# 设计核心（与 rawproc 分工对齐）：
-#   * 输入是 rawproc 产出的 events_tsorted/bucket=xxxxxx，桶间全局有序、
-#     桶内按 (machine_ts, log_offset) 有序，故顺序归并即全局时间序。
-#   * replay 以 fd 为准而非 path：IO 类操作只信赖 (pid, fd)，经 per-pid fd
-#     表映射到本进程真实打开的 fd，对真实 fd 执行 syscall（openat-replay）。
-#   * 在受限沙箱根目录下真实执行 syscall，路径防穿越。
+# Core design (aligned with the rawproc division of labor):
+#   * The input is rawproc's events_tsorted/bucket=xxxxxx: globally ordered
+#     across buckets, ordered by (machine_ts, log_offset) within a bucket, so a
+#     sequential merge yields the global time order.
+#   * replay is fd-first rather than path-first: IO operations trust only
+#     (pid, fd), mapped through a per-pid fd table to the fd actually opened by
+#     this process, on which the syscall is executed (openat-replay).
+#   * Real syscalls are executed under a restricted sandbox root, with path
+#     traversal protection.
 # ============================================================================
 
 project(trace_replay VERSION 0.1.0 LANGUAGES CXX)
@@ -33,16 +39,16 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 默认 Release，trace 数据量大、需要性能
+# Default to Release; trace data is large and performance matters.
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-option(TR_TRACE_REPLAY_BUILD_TESTS "构建 trace-replay 的单元测试" OFF)
+option(TR_TRACE_REPLAY_BUILD_TESTS "Build trace-replay unit tests" OFF)
 
-# 编译警告配置（公共）
+# Compile warning configuration (shared)
 add_library(TraceReplayWarnings INTERFACE)
 target_include_directories(TraceReplayWarnings INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -50,22 +56,24 @@ include(cmake/CompilerWarnings.cmake)
 set_project_warnings(TraceReplayWarnings)
 
 # ----------------------------------------------------------------------------
-# 第三方依赖
+# Third-party dependencies
 # ----------------------------------------------------------------------------
 
-# 解析 rawproc 产出的 Parquet，依赖 Apache Arrow。
+# Parsing rawproc's Parquet output depends on Apache Arrow.
 find_package(Arrow CONFIG REQUIRED)
 find_package(Parquet CONFIG REQUIRED)
 
-# JSON 配置解析，使用 nlohmann/json（header-only）。
+# JSON config parsing uses nlohmann/json (header-only).
 find_package(nlohmann_json CONFIG REQUIRED)
 
-# 选择 Arrow 链接目标：动态库优先（vcpkg x64-windows 默认动态）。
+# Choose the Arrow link target: prefer the shared library (vcpkg x64-windows is
+# dynamic by default).
 set(_ARROW_TARGET "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,Arrow::arrow_static,Arrow::arrow_shared>")
 set(_PARQUET_TARGET "$<IF:$<BOOL:${ARROW_BUILD_STATIC}>,Parquet::parquet_static,Parquet::parquet_shared>")
 
 # ============================================================================
-# 核心静态库：解析、排序归并、fd 表、路径解析、replay 引擎
+# Core static library: parsing, sort/merge, fd table, path resolution, replay
+# engine.
 # ============================================================================
 add_library(TraceReplayCore STATIC
     src/core/Error.cpp
@@ -88,16 +96,16 @@ target_link_libraries(TraceReplayCore PUBLIC
 )
 
 # ============================================================================
-# 可执行入口
+# Executable entry point
 # ============================================================================
 add_executable(trace_replay src/main.cpp)
 target_link_libraries(trace_replay PRIVATE TraceReplayCore)
 
 # ----------------------------------------------------------------------------
-# 单元测试（可选）
+# Unit tests (optional)
 # ----------------------------------------------------------------------------
 if(TR_TRACE_REPLAY_BUILD_TESTS)
     enable_testing()
-    # TODO: 接入 GoogleTest 后在此添加 add_subdirectory(tests)
-    message(STATUS "TR_TRACE_REPLAY_BUILD_TESTS=ON，但测试框架尚未接入。")
+    # TODO: once GoogleTest is wired up, add add_subdirectory(tests) here.
+    message(STATUS "TR_TRACE_REPLAY_BUILD_TESTS=ON, but the test framework is not yet wired up.")
 endif()

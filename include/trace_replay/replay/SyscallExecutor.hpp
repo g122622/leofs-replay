@@ -7,18 +7,22 @@
 namespace trace_replay {
 
 // ============================================================================
-// Syscall 执行器 —— 真实执行
+// Syscall executor — real execution
 //
-// 在受限沙箱根目录下对真实文件系统执行 syscall，是 replay 的核心语义。
-// 关键：以 fd 为准。IO 操作只信赖 (pid, arg1=fd)，经 fd 表映射到本进程真实
-// 打开的 fd，再对本进程 fd 执行 read/write 等。
+// Executes syscalls against the real filesystem under a restricted sandbox root;
+// this is the core semantics of replay. Key point: fd is authoritative. IO
+// operations trust only (pid, arg1=fd), mapped through the fd table to the fd
+// actually opened by this process, on which read/write etc. are then executed.
 //
-// 路径防穿越由 PathResolver 保障：所有解析出的路径都强制落在 sandboxRoot 下。
+// Path traversal protection is ensured by PathResolver: all resolved paths are
+// forced to stay under sandboxRoot.
 //
-// 说明：原始 trace 中 read/write 的 ret 表示"实际读写字节数"。我们无法复现
-// 原始数据内容（trace 不含数据负载），故对 read 用零填充缓冲、对 write 写出
-// ret 字节的占位数据，目的是还原"该 fd 上发生了 N 字节 IO"的时间序列语义，
-// 而非还原数据本身。这一点在 README 中明示。
+// Note: in the original trace, the ret of read/write means "actual bytes
+// read/written". We cannot reproduce the original data content (the trace
+// carries no payload), so read uses a zero-filled buffer and write writes `ret`
+// bytes of placeholder data, in order to reproduce the time-series semantics of
+// "N bytes of IO occurred on this fd" — not the data itself. This is stated
+// explicitly in the README.
 // ============================================================================
 
 class SyscallExecutor final : public IExecutor {

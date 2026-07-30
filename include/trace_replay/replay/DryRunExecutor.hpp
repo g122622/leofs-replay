@@ -7,10 +7,11 @@
 namespace trace_replay {
 
 // ============================================================================
-// Dry-Run 执行器
+// Dry-run executor
 //
-// 不执行任何真实 syscall，仅按"以 fd 为准"的逻辑推演 fd 表与路径，并打印
-// 每条事件。用于校验解析、排序、fd 映射逻辑是否正确，安全可重复。
+// Executes no real syscalls; only simulates the fd table and paths following the
+// "fd is authoritative" logic, and prints each event. Used to verify that the
+// parsing, sorting, and fd-mapping logic is correct; safe and repeatable.
 // ============================================================================
 
 class DryRunExecutor final : public IExecutor {
@@ -29,7 +30,7 @@ private:
     FdTable       m_fdTable;
     PathResolver  m_resolver;
     std::ostream& m_log;
-    Fd            m_nextDryFd {3};   // dry-run 虚拟 fd 计数器，从 3 起（避开 0/1/2）
+    Fd            m_nextDryFd {3};   // dry-run virtual fd counter, starting at 3 (avoiding 0/1/2)
 };
 
 }  // namespace trace_replay

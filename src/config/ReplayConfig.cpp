@@ -18,13 +18,14 @@ namespace {
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-/// 读取整个文件为字符串。配置文件通常很小，一次读入即可。
+/// Read the entire file as a string. Config files are usually small; one read
+/// suffices.
 [[nodiscard]] Result<std::string> readFile(std::string_view path)
 {
     std::ifstream ifs{std::string{path}};
     if (!ifs) {
         return Error::ioError(
-            std::string{"无法打开配置文件: "} + std::string{path},
+            std::string{"cannot open config file: "} + std::string{path},
             "ReplayConfig::readFile");
     }
     std::ostringstream oss;
@@ -32,7 +33,8 @@ using json = nlohmann::json;
     return oss.str();
 }
 
-/// 安全地从 json 取字符串字段，缺失或类型不符返回默认值
+/// Safely read a string field from json; returns the default if missing or the
+/// type mismatches.
 std::string getString(const json& j, const char* key, std::string def = {})
 {
     if (j.contains(key) && j[key].is_string()) {
@@ -41,24 +43,26 @@ std::string getString(const json& j, const char* key, std::string def = {})
     return def;
 }
 
-/// 把 nlohmann json 返回的 UTF-8 std::string 转为 fs::path。
+/// Convert a UTF-8 std::string returned by nlohmann json into an fs::path.
 ///
-/// 关键：在 Windows 上 fs::path(std::string) 会按系统 ACP（CP_ACP）解释字节，
-/// 非非 ASCII 路径（如含中文"下载"的目录）会被损坏，导致 fs::exists/Open 失败。
-/// nlohmann json 的字符串是 UTF-8，故这里经 u8string 中转，让 fs::path 按
-/// UTF-8 解码，跨平台正确处理任意 Unicode 路径。
+/// Key point: on Windows, fs::path(std::string) interprets the bytes using the
+/// system ACP (CP_ACP), so non-ASCII paths (e.g. a directory containing CJK
+/// characters such as "下载") get corrupted, causing fs::exists/Open to fail.
+/// nlohmann json strings are UTF-8, so we go through a u8string here to let
+/// fs::path decode as UTF-8, correctly handling arbitrary Unicode paths
+/// cross-platform.
 fs::path utf8ToPath(std::string_view s)
 {
 #if defined(_WIN32)
-    // Windows：fs::path(u8string) 按 UTF-8 解码为内部 UTF-16 存储
+    // Windows: fs::path(u8string) decodes as UTF-8 into internal UTF-16 storage
     return fs::path{std::u8string{s.begin(), s.end()}};
 #else
-    // POSIX：原生 char 即 UTF-8，直接构造
+    // POSIX: native char is UTF-8; construct directly
     return fs::path{std::string{s}};
 #endif
 }
 
-/// 安全地取整型字段
+/// Safely read an integer field
 template <typename Int>
 Int getInt(const json& j, const char* key, Int def)
 {
@@ -88,14 +92,14 @@ PaceMode parsePaceMode(std::string_view s)
 {
     if (s == "real")   return PaceMode::Real;
     if (s == "scaled") return PaceMode::Scaled;
-    return PaceMode::Fast;   // "fast" 或未知都退化为最快
+    return PaceMode::Fast;   // "fast" or unknown both fall back to fastest
 }
 
 Side parseSide(std::string_view s)
 {
     if (s == "source") return Side::Source;
     if (s == "target") return Side::Target;
-    return Side::Other;      // "other"/"all" 表示不过滤
+    return Side::Other;      // "other"/"all" means no filtering
 }
 
 }  // namespace
@@ -110,34 +114,34 @@ Result<ReplayConfig> ReplayConfig::loadFromJson(std::string_view path)
         j = json::parse(content);
     } catch (const json::parse_error& e) {
         return Error::invalidFormat(
-            std::string{"JSON 解析失败: "} + e.what(),
+            std::string{"JSON parse failed: "} + e.what(),
             "ReplayConfig::loadFromJson");
     }
 
-    // 输入
+    // Input
     cfg.eventsRoot   = utf8ToPath(getString(j, "events_root"));
     cfg.bucketWidth  = getInt(j, "bucket_width", 6);
     cfg.bucketMin    = getInt(j, "bucket_min", 0);
     cfg.bucketMax    = getInt(j, "bucket_max", -1);
 
-    // 沙箱
+    // Sandbox
     cfg.sandboxRoot  = utf8ToPath(getString(j, "sandbox_root"));
 
-    // 节拍
+    // Pacing
     cfg.paceMode     = parsePaceMode(getString(j, "pace_mode", "fast"));
     cfg.speed        = getDouble(j, "speed", 1.0);
 
-    // 过滤
+    // Filtering
     cfg.sideFilter   = parseSide(getString(j, "side_filter", "all"));
     cfg.skipUnparsed = getBool(j, "skip_unparsed", true);
 
-    // 行为
+    // Behavior
     cfg.dryRun         = getBool(j, "dry_run", false);
     cfg.maxIoBytes     = getInt(j, "max_io_bytes", 1 << 20);
     cfg.continueOnError = getBool(j, "continue_on_error", true);
     cfg.maxEvents      = static_cast<u64>(getInt<i64>(j, "max_events", 0));
 
-    // pid 过滤列表
+    // pid filter list
     cfg.pidFilter.clear();
     if (j.contains("pid_filter") && j["pid_filter"].is_array()) {
         for (const auto& v : j["pid_filter"]) {
@@ -153,19 +157,19 @@ Result<ReplayConfig> ReplayConfig::loadFromJson(std::string_view path)
 Result<void> ReplayConfig::validate()
 {
     if (eventsRoot.empty()) {
-        return Error::invalidArgument("events_root 不能为空", "ReplayConfig::validate");
+        return Error::invalidArgument("events_root must not be empty", "ReplayConfig::validate");
     }
     if (sandboxRoot.empty()) {
-        return Error::invalidArgument("sandbox_root 不能为空", "ReplayConfig::validate");
+        return Error::invalidArgument("sandbox_root must not be empty", "ReplayConfig::validate");
     }
 
-    // 规范化为绝对路径，便于后续路径穿越校验
+    // Normalize to absolute paths for later path-traversal checks
     std::error_code ec;
     auto absEvents  = fs::absolute(eventsRoot, ec);
     auto absSandbox = fs::absolute(sandboxRoot, ec);
     if (ec) {
         return Error::invalidArgument(
-            std::string{"路径规范化失败: "} + ec.message(),
+            std::string{"path normalization failed: "} + ec.message(),
             "ReplayConfig::validate");
     }
     eventsRoot   = fs::weakly_canonical(absEvents, ec);
@@ -173,24 +177,25 @@ Result<void> ReplayConfig::validate()
 
     if (!fs::exists(eventsRoot)) {
         return Error::notFound(
-            "events_root 不存在: " + eventsRoot.string(),
+            "events_root does not exist: " + eventsRoot.string(),
             "ReplayConfig::validate");
     }
-    // sandboxRoot 若不存在则尝试创建（首次回放需要落盘）
+    // If sandboxRoot does not exist, try to create it (first-time replay needs
+    // to persist to disk)
     if (!fs::exists(sandboxRoot)) {
         fs::create_directories(sandboxRoot, ec);
         if (ec) {
             return Error::ioError(
-                "无法创建 sandbox_root: " + sandboxRoot.string() + " : " + ec.message(),
+                "cannot create sandbox_root: " + sandboxRoot.string() + " : " + ec.message(),
                 "ReplayConfig::validate");
         }
     }
 
     if (paceMode == PaceMode::Scaled && speed <= 0.0) {
-        return Error::invalidArgument("scaled 模式下 speed 必须为正", "ReplayConfig::validate");
+        return Error::invalidArgument("speed must be positive in scaled mode", "ReplayConfig::validate");
     }
     if (bucketWidth < 1) {
-        return Error::invalidArgument("bucket_width 必须 >= 1", "ReplayConfig::validate");
+        return Error::invalidArgument("bucket_width must be >= 1", "ReplayConfig::validate");
     }
 
     return Result<void>::ok();

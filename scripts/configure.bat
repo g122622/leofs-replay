@@ -2,11 +2,12 @@
 setlocal enabledelayedexpansion
 
 :: ============================================================
-:: trace-replay 构建 wrapper（仿 Cubium）
-:: 自动注入 VS 开发环境，再调用 CMake（vcpkg manifest 模式自动装依赖）。
-:: 用法:
-::   configure.bat            - 配置 (Release, clang, Ninja)
-::   configure.bat build      - 配置 + 构建
+:: trace-replay build wrapper (modeled on Cubium).
+:: Automatically injects the VS development environment, then invokes CMake
+:: (vcpkg manifest mode auto-installs dependencies).
+:: Usage:
+::   configure.bat            - configure (Release, clang, Ninja)
+::   configure.bat build      - configure + build
 :: ============================================================
 
 set "VSBASE=D:\Program Files\Microsoft Visual Studio\18\Community"

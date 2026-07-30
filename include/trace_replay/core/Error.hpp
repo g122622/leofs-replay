@@ -6,29 +6,30 @@
 namespace trace_replay {
 
 // ============================================================================
-// 错误类型
+// Error type
 //
-// 对齐 Cubium 规范 7：用 Result/Error 传播错误，禁止异常。错误携带
-//   code    —— 粗分类，便于调用方按类别处理
-//   message —— 人类可读描述
-//   source  —— 出错位置（一般是 "Class::method"），便于定位
+// Aligned with Cubium spec 7: propagate errors via Result/Error, no exceptions.
+// An error carries:
+//   code    — coarse category, so callers can handle by category
+//   message — human-readable description
+//   source  — error location (usually "Class::method"), for quick locating
 // ============================================================================
 
 /**
- * @brief 错误对象，可被 Result 携带传播
+ * @brief Error object, can be carried and propagated by Result
  */
 class Error {
 public:
-    /// 错误粗分类
+    /// Coarse error category
     enum class Code {
         Ok = 0,
-        NotFound,           // 文件/桶/列不存在
-        InvalidArgument,    // 参数非法（空路径、非法配置等）
-        InvalidFormat,      // trace 行/列格式无法解析
-        OutOfRange,         // 下标越界、数值越界
-        IOError,            // 文件/Parquet 读写失败
-        Syscall,            // replay 时真实 syscall 失败
-        Internal,           // 内部不变量被破坏
+        NotFound,           // file/bucket/column does not exist
+        InvalidArgument,    // illegal argument (empty path, invalid config, etc.)
+        InvalidFormat,      // trace line/column format cannot be parsed
+        OutOfRange,         // index out of range, numeric overflow
+        IOError,            // file/Parquet read/write failure
+        Syscall,            // a real syscall failed during replay
+        Internal,           // an internal invariant was broken
     };
 
     Error() = default;
@@ -42,10 +43,10 @@ public:
     [[nodiscard]] const std::string& message() const noexcept { return m_message; }
     [[nodiscard]] const std::string& source() const noexcept { return m_source; }
 
-    /// 拼成单行字符串，便于日志输出
+    /// Join into a single-line string for easy log output
     [[nodiscard]] std::string toString() const;
 
-    // 常用工厂方法
+    // Common factory methods
     [[nodiscard]] static Error invalidArgument(std::string msg, std::string src = {});
     [[nodiscard]] static Error invalidFormat(std::string msg, std::string src = {});
     [[nodiscard]] static Error notFound(std::string msg, std::string src = {});

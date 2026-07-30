@@ -1,11 +1,12 @@
 #pragma once
 
 // ============================================================================
-// 基础类型别名
+// Basic type aliases
 //
-// 与 Cubium 主体一致使用固定宽度整数别名，避免在不同平台上 int/long 宽度
-// 不一致带来的解析歧义。trace 中 ts 是浮点（machine_ts），log_offset/pid 是
-// 整型，故这里给出对应别名。
+// Like the Cubium main project, fixed-width integer aliases are used to avoid
+// parsing ambiguity from platform-dependent int/long widths. In the trace, ts
+// is a float (machine_ts), while log_offset/pid are integers, so the matching
+// aliases are provided here.
 // ============================================================================
 
 #include <cstdint>
@@ -21,8 +22,8 @@ using u32 = std::uint32_t;
 using i64 = std::int64_t;
 using u64 = std::uint64_t;
 
-// trace 中 fd 即非负 int；arg1/arg2 在原始 trace 中是十六进制字符串，
-// 解析后用 i64 容纳（Linux 下 fd/offset 都能放进 i64）
+// In the trace, fd is a non-negative int; arg1/arg2 are hex strings in the
+// original trace, parsed into i64 here (on Linux both fd and offset fit in i64).
 using Fd  = i32;
 
 }  // namespace trace_replay

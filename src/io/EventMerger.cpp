@@ -13,7 +13,8 @@ namespace {
 
 namespace fs = std::filesystem;
 
-/// 解析桶目录名 "bucket=008467" → 数字 8467；非法返回 nullopt
+/// Parse a bucket directory name "bucket=008467" → number 8467; returns nullopt
+/// if invalid.
 std::optional<long> parseBucketName(const std::string& dirName)
 {
     constexpr std::string_view prefix = "bucket=";
@@ -21,7 +22,7 @@ std::optional<long> parseBucketName(const std::string& dirName)
         return std::nullopt;
     }
     std::string num = dirName.substr(prefix.size());
-    // 跳过前导零后解析
+    // Parse after skipping leading zeros
     try {
         size_t pos = 0;
         long v = std::stol(num, &pos);
@@ -34,7 +35,7 @@ std::optional<long> parseBucketName(const std::string& dirName)
     }
 }
 
-/// 窗口判断：桶编号是否落在配置范围内
+/// Range check: whether the bucket number falls within the configured range
 bool inRange(long bucket, const ReplayConfig& cfg)
 {
     if (bucket < cfg.bucketMin) {
@@ -54,9 +55,10 @@ Result<void> EventMerger::open(const ReplayConfig& cfg)
 
     std::error_code ec;
 
-    // —— 单文件直读模式 ——
-    // 当 events_root 直接指向一个 .parquet 文件时，绕过分桶目录枚举，
-    // 只挂一个读取器。文件已全局排序，K 路堆退化为直通。
+    // —— Single-file direct-read mode ——
+    // When events_root points directly at a .parquet file, bypass the bucketed
+    // directory enumeration and attach only one reader. The file is already
+    // globally sorted; the K-way heap degenerates to a passthrough.
     if (fs::is_regular_file(cfg.eventsRoot, ec) &&
         cfg.eventsRoot.extension() == ".parquet") {
         m_readers.reserve(1);
@@ -71,12 +73,13 @@ Result<void> EventMerger::open(const ReplayConfig& cfg)
     const fs::path tsorted = cfg.eventsRoot / "events_tsorted";
     if (!fs::exists(tsorted, ec)) {
         return Error::notFound(
-            "未找到 events_tsorted 目录: " + tsorted.string() +
-            "（events_root 也可直接指向单个 .parquet 文件）",
+            "events_tsorted directory not found: " + tsorted.string() +
+            " (events_root may also point directly at a single .parquet file)",
             "EventMerger::open");
     }
 
-    // 枚举所有 bucket= 目录，按编号排序后建 reader
+    // Enumerate all bucket= directories, sort by number, then build a reader
+    // for each.
     std::vector<std::pair<long, fs::path>> buckets;
     for (auto& entry : fs::directory_iterator{tsorted, ec}) {
         if (!entry.is_directory()) {
@@ -85,11 +88,13 @@ Result<void> EventMerger::open(const ReplayConfig& cfg)
         std::string name = entry.path().filename().string();
         auto bucket = parseBucketName(name);
         if (!bucket) {
-            // _unparsed / null_ts 等特殊桶：按配置决定是否跳过
+            // Special buckets like _unparsed / null_ts: skip per config
             if (cfg.skipUnparsed) {
                 continue;
             }
-            // 不跳过时无法归并入数字序，仍忽略（仅数字桶参与全局时间序）
+            // When not skipping, they still cannot be merged into the numeric
+            // order; ignore them (only numeric buckets take part in the global
+            // time order)
             continue;
         }
         if (!inRange(*bucket, cfg)) {
@@ -117,7 +122,8 @@ Result<void> EventMerger::open(const ReplayConfig& cfg)
 
 Result<void> EventMerger::primeHeap()
 {
-    // 预取每个 reader 的首个事件，压入堆。空 reader 标记 done。
+    // Prefetch each reader's first event and push it into the heap. Mark empty
+    // readers as done.
     for (size_t i = 0; i < m_readers.size(); ++i) {
         TR_TRY(opt, m_readers[i]->next());
         if (!opt) {
@@ -136,7 +142,7 @@ Result<std::optional<TraceEvent>> EventMerger::next()
         return std::optional<TraceEvent>{};
     }
 
-    // 弹出全局最小，回填该 reader 的下一条
+    // Pop the global minimum and refill that reader's next event
     HeapNode top = m_heap.top();
     m_heap.pop();
 

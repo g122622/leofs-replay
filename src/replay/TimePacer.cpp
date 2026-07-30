@@ -27,8 +27,9 @@ void TimePacer::pace(double machineTs)
         return;
     }
 
-    // 相邻事件原始间隔（秒）。trace 中可能因桶边界出现极小负值（rawproc 的
-    // near-sorted 残余倒置），用 max(0,...) 兜住。
+    // Original gap between adjacent events (seconds). The trace may have tiny
+    // negative values at bucket boundaries (residual near-sorted inversions
+    // from rawproc); clamp with max(0, ...).
     const double deltaSec = machineTs > m_lastTs ? (machineTs - m_lastTs) : 0.0;
     m_lastTs = machineTs;
 
@@ -38,7 +39,8 @@ void TimePacer::pace(double machineTs)
     }
 
     if (sleepSec > 0.0) {
-        // 截断到合理上限，避免单次 sleep 过久（trace 间隔异常大时）
+        // Clamp to a sane upper bound to avoid sleeping too long in one call
+        // (when a trace gap is abnormally large)
         if (sleepSec > 3600.0) {
             sleepSec = 3600.0;
         }

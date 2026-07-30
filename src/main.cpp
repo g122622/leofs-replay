@@ -1,11 +1,12 @@
 // ============================================================================
-// trace-replay 入口
+// trace-replay entry point
 //
-// 用法:
+// Usage:
 //   trace_replay <config.json>
 //
-// 配置文件为 JSON（结构见 README 与 ReplayConfig）。根据 dry_run 字段选择
-// DryRunExecutor（仅推演）或 SyscallExecutor（真实执行 syscall）。
+// The config file is JSON (structure in README and ReplayConfig). Based on the
+// dry_run field, selects DryRunExecutor (simulate only) or SyscallExecutor
+// (real syscall execution).
 // ============================================================================
 
 #include "trace_replay/config/ReplayConfig.hpp"
@@ -22,20 +23,20 @@ using namespace trace_replay;
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        std::cerr << "用法: trace_replay <config.json>\n";
+        std::cerr << "Usage: trace_replay <config.json>\n";
         return 2;
     }
 
-    // 加载并校验配置
+    // Load and validate the config
     auto cfgResult = ReplayConfig::loadFromJson(argv[1]);
     if (!cfgResult.success()) {
-        std::cerr << "[error] 配置加载失败: " << cfgResult.error().toString() << '\n';
+        std::cerr << "[error] config load failed: " << cfgResult.error().toString() << '\n';
         return 1;
     }
     auto cfg = std::move(cfgResult).value();
 
     if (auto v = cfg.validate(); !v.success()) {
-        std::cerr << "[error] 配置校验失败: " << v.error().toString() << '\n';
+        std::cerr << "[error] config validation failed: " << v.error().toString() << '\n';
         return 1;
     }
 
@@ -43,7 +44,7 @@ int main(int argc, char** argv)
               << "[main] sandbox_root=" << cfg.sandboxRoot << '\n'
               << "[main] dry_run=" << (cfg.dryRun ? "true" : "false") << '\n';
 
-    // 按配置选择执行器
+    // Select the executor per config
     std::unique_ptr<IExecutor> executor;
     if (cfg.dryRun) {
         executor = std::make_unique<DryRunExecutor>(cfg.sandboxRoot, std::cerr);
@@ -52,16 +53,16 @@ int main(int argc, char** argv)
             cfg.sandboxRoot, cfg.maxIoBytes, cfg.continueOnError, std::cerr);
     }
 
-    // 构造并运行引擎
+    // Build and run the engine
     ReplayEngine engine{std::move(cfg), std::move(executor), std::cerr};
     auto result = engine.run();
     if (!result.success()) {
-        std::cerr << "[error] 回放中止: " << result.error().toString() << '\n';
+        std::cerr << "[error] replay aborted: " << result.error().toString() << '\n';
         return 1;
     }
 
     const auto& s = result.value();
-    std::cerr << "[main] 完成: total=" << s.totalEvents
+    std::cerr << "[main] done: total=" << s.totalEvents
               << " processed=" << s.processed
               << " skipped=" << s.skipped
               << " failed=" << s.failed

@@ -1,117 +1,117 @@
 # trace-replay
 
-按时间序列回放 rawproc 排序后 Parquet trace 的事件流，在受限沙箱内真实执行 syscall。
+Replays the event stream of a rawproc-sorted Parquet trace in time-series order, executing real syscalls inside a restricted sandbox.
 
-## 与 rawproc 的分工
+## Division of labor with rawproc
 
-本项目对应 context.md 中提到的 **openat-replay**：rawproc（`rawproc_spark.py`）只做解析、挂载映射、按 `(machine_ts, log_offset)` 分桶排序并产出 `events_tsorted/bucket=NNNNNN`；它**不碰 fd**。本项目消费那份已排序的输出，做真正的回放。
+This project corresponds to the **openat-replay** mentioned in context.md: rawproc (`rawproc_spark.py`) only parses, performs mount mapping, buckets by `(machine_ts, log_offset)`, sorts, and produces `events_tsorted/bucket=NNNNNN`; it **never touches fd**. This project consumes that sorted output and performs the actual replay.
 
-核心原则：**以 fd 为准，而不是 path。**
+Core principle: **fd takes precedence over path.**
 
-- rawproc 排序保证：桶间全局有序、无重叠，桶内按 `(machine_ts, log_offset)` 有序。
-- 因此 `EventMerger` 只需顺序归并各桶，即得到全局时间序事件流——这就是 replay 的时间序列来源。
-- IO 类操作（`read`/`write`/`pread64`/`pwrite64`/`readv`/`writev`）的 `path` 列不可信甚至为空，真正携带文件信息的是 `(pid, arg1=fd)`。回放时只信赖 `(pid, fd)`，经 per-pid fd 表映射到本回放进程真实打开的 fd，再对其执行真实 syscall。
+- rawproc sort guarantees: globally ordered across buckets, no overlap, and within each bucket ordered by `(machine_ts, log_offset)`.
+- Therefore `EventMerger` only needs to sequentially merge each bucket to obtain a globally time-ordered event stream — this is the source of the replay time series.
+- The `path` column of IO operations (`read`/`write`/`pread64`/`pwrite64`/`readv`/`writev`) is unreliable or even empty; the real file information is carried by `(pid, arg1=fd)`. During replay only `(pid, fd)` is trusted, mapped through a per-pid fd table to the fd actually opened by this replay process, on which the real syscall is then executed.
 
-## 目录结构
+## Directory structure
 
 ```
 trace-replay/
 ├── CMakeLists.txt
 ├── cmake/CompilerWarnings.cmake
-├── config.example.json          # JSON 配置示例
+├── config.example.json          # JSON config example
 ├── include/trace_replay/
 │   ├── core/    Types/Assert/Error/Result/TraceEvent/SyscallClassify
 │   ├── config/  ReplayConfig
 │   ├── io/      IEventReader/ParquetEventReader/EventMerger
 │   ├── model/   FdTable/PathResolver
 │   └── replay/  IExecutor/TimePacer/DryRunExecutor/SyscallExecutor/ReplayEngine
-├── src/         （与 include 一一对应的 .cpp + main.cpp）
+├── src/         (.cpp files one-to-one with include + main.cpp)
 └── README.md
 ```
 
-## 数据流
+## Data flow
 
 ```
 events_tsorted/bucket=NNNNNN  ─┐
-events_tsorted/bucket=NNNNNN  ─┤  ParquetEventReader（每桶一个，桶内已排序）
+events_tsorted/bucket=NNNNNN  ─┤  ParquetEventReader (one per bucket, sorted within)
 events_tsorted/bucket=NNNNNN  ─┘
                   │
-            EventMerger  ── K 路小顶堆归并（machine_ts, log_offset）── 全局时间序
+            EventMerger  ── K-way min-heap merge (machine_ts, log_offset) ── global time order
                   │
-            ReplayEngine ── 过滤(pid/side) ── TimePacer(节拍) ── IExecutor
+            ReplayEngine ── filter(pid/side) ── TimePacer(pacing) ── IExecutor
                                                                         │
                                           ┌─────────────────────────────┴──┐
                                   DryRunExecutor                      SyscallExecutor
-                                  （推演 fd 表/路径，打印）          （沙箱内真实 syscall）
+                                  (simulate fd table/path, print)     (real syscalls in sandbox)
 ```
 
-## fd 表语义
+## fd table semantics
 
-| 原始 trace 事件 | fd 表动作 | 真实 syscall |
+| Original trace event | fd table action | Real syscall |
 |---|---|---|
-| `openat` 成功（ret=fd） | 登记 `(pid, origFd=ret) → (ourFd, path)` | 本进程 `::open` 得 ourFd |
-| `read`/`write`（arg1=fd） | 查表得 ourFd | 对 ourFd `::read`/`::write` |
-| `close`（arg1=fd） | 注销，取回 ourFd | `::close(ourFd)` |
-| `stat`/`mkdir`/`unlink`/`rename` | 解析路径（防穿越） | 对应真实 syscall |
+| `openat` success (ret=fd) | register `(pid, origFd=ret) → (ourFd, path)` | this process `::open` to get ourFd |
+| `read`/`write` (arg1=fd) | look up ourFd in table | `::read`/`::write` on ourFd |
+| `close` (arg1=fd) | unregister, reclaim ourFd | `::close(ourFd)` |
+| `stat`/`mkdir`/`unlink`/`rename` | resolve path (with traversal protection) | corresponding real syscall |
 
-> 说明：trace 不含数据负载，故 `read` 用零缓冲、`write` 写零字节占位，目的是还原"该 fd 上发生 N 字节 IO"的**时间序列语义**，而非还原数据内容。
+> Note: the trace carries no data payload, so `read` uses a zero buffer and `write` writes zero bytes as a placeholder. The goal is to reproduce the **time-series semantics** of "N bytes of IO occurred on this fd", not the data content.
 
-## 配置（JSON）
+## Configuration (JSON)
 
-见 `config.example.json`。关键字段：
+See `config.example.json`. Key fields:
 
-| 字段 | 含义 |
+| Field | Meaning |
 |---|---|
-| `events_root` | rawproc 产出根目录（其下应有 `events_tsorted/`） |
-| `sandbox_root` | 真实 syscall 的根目录，所有路径强制落在其下（防穿越） |
-| `bucket_width` | 桶目录名宽度（默认 6，对齐 rawproc） |
-| `bucket_min`/`bucket_max` | 只回放该范围内的桶（闭区间，`-1` 表示无上限） |
+| `events_root` | rawproc output root directory (should contain `events_tsorted/` underneath) |
+| `sandbox_root` | root directory for real syscalls; all paths are forced to stay under it (traversal protection) |
+| `bucket_width` | bucket directory name width (default 6, aligned with rawproc) |
+| `bucket_min`/`bucket_max` | only replay buckets within this range (closed interval; `-1` means no upper bound) |
 | `pace_mode` | `fast` / `real` / `scaled` |
-| `speed` | `scaled` 模式倍速 |
+| `speed` | speed multiplier for `scaled` mode |
 | `side_filter` | `all` / `source` / `target` |
-| `skip_unparsed` | 是否跳过 `_unparsed` / `null_ts` 桶 |
-| `pid_filter` | 只回放这些 pid（数组，空=全部） |
-| `dry_run` | `true`=仅推演不执行 syscall；`false`=真实执行 |
-| `max_io_bytes` | 单次 IO 上限（默认 1 MiB） |
-| `continue_on_error` | syscall 失败时是否继续 |
+| `skip_unparsed` | whether to skip `_unparsed` / `null_ts` buckets |
+| `pid_filter` | only replay these pids (array; empty = all) |
+| `dry_run` | `true` = simulate only, do not execute syscalls; `false` = real execution |
+| `max_io_bytes` | per-IO upper bound (default 1 MiB) |
+| `continue_on_error` | whether to continue on syscall failure |
 
-## 用法
+## Usage
 
 ```
 trace_replay config.json
 ```
 
-## 构建依赖
+## Build dependencies
 
 - C++20
-- Apache Arrow（含 Parquet）：`vcpkg install arrow[parquet]` 或经 manifest 自动安装
-- nlohmann_json：`vcpkg install nlohmann-json`
+- Apache Arrow (including Parquet): `vcpkg install arrow[parquet]`, or auto-installed via manifest
+- nlohmann_json: `vcpkg install nlohmann-json`
 
-## 构建（Windows / clang）
+## Build (Windows / clang)
 
-项目提供 `scripts/configure.bat`，自动注入 VS 开发环境（vcpkg 需 `cl.exe` 定位
-工具链，本机的 VS 预览版不被 `vswhere` 识别，必须先注入环境）。
+The project provides `scripts/configure.bat`, which automatically injects the VS development environment (vcpkg needs `cl.exe` to locate the toolchain; the VS Preview on this machine is not recognized by `vswhere`, so the environment must be injected first).
 
 ```bat
-:: 配置（manifest 模式自动装 arrow/nlohmann-json）
+:: Configure (manifest mode auto-installs arrow/nlohmann-json)
 scripts\configure.bat
 
-:: 配置 + 构建
+:: Configure + build
 scripts\configure.bat build
 ```
 
-该脚本使用 `clang++`（GNU 风格命令行）+ Ninja Multi-Config，产物在
-`build/bin/Debug/trace_replay.exe` 与 `build/bin/Release/trace_replay.exe`，运行时
-依赖的 Arrow/Parquet DLL 由 vcpkg 自动部署到同目录。
+The script uses `clang++` (GNU-style command line) + Ninja Multi-Config. The output is in
+`build/bin/Debug/trace_replay.exe` and `build/bin/Release/trace_replay.exe`; the Arrow/Parquet
+DLLs required at runtime are automatically deployed by vcpkg to the same directory.
 
-> 真实 syscall 执行器（`SyscallExecutor`）依赖 POSIX（`openat`/`read`/`rename` 等），
-> 仅在 Linux 构建运行；Windows 下 `SyscallExecutor` 为占位实现（`execute` 一律返回
-> "平台不支持"），仅 `DryRunExecutor` 路径与解析层可实际运行。如需 Windows 真实回放，
-> 需将 syscall 层移植到 Win32 API。
+> The real syscall executor (`SyscallExecutor`) depends on POSIX (`openat`/`read`/`rename`, etc.)
+> and only builds/runs on Linux. On Windows, `SyscallExecutor` is a placeholder implementation
+> (its `execute` always returns "platform not supported"); only the `DryRunExecutor` path and the
+> resolution layer can actually run. For real replay on Windows, the syscall layer must be ported
+> to the Win32 API.
 
-## 已知 TODO
+## Known TODOs
 
-- `dup`/`dup2`/`dup3`、`exit(group)` 对 fd 表的影响尚未覆盖。
-- `getdents`/`utimensat`/xattr 等暂未真实执行（标记 skipped）。
-- 单元测试框架尚未接入（`TR_TRACE_REPLAY_BUILD_TESTS` 占位）。
-- Windows 下 `SyscallExecutor` 为占位实现，真实回放需移植到 Win32 API。
+- The effects of `dup`/`dup2`/`dup3` and `exit(group)` on the fd table are not yet covered.
+- `getdents`/`utimensat`/xattr etc. are not yet executed for real (marked as skipped).
+- The unit test framework is not yet wired up (`TR_TRACE_REPLAY_BUILD_TESTS` placeholder).
+- On Windows, `SyscallExecutor` is a placeholder implementation; real replay requires porting to the Win32 API.

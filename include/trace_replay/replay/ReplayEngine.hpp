@@ -12,25 +12,26 @@
 namespace trace_replay {
 
 // ============================================================================
-// 回放引擎
+// Replay engine
 //
-// 编排：EventMerger（全局时间序事件流）→ TimePacer（节拍）→ IExecutor（执行）。
-// 负责事件过滤（pid/side）、错误策略（continueOnError）、运行统计。
+// Orchestrates: EventMerger (globally time-ordered event stream) → TimePacer
+// (pacing) → IExecutor (execution). Handles event filtering (pid/side), error
+// policy (continueOnError), and run statistics.
 // ============================================================================
 
-/// 运行统计
+/// Run statistics
 struct ReplayStats {
-    u64 totalEvents {0};     // 归并器吐出的总事件数
-    u64 processed {0};       // 实际执行（含 skipped）的事件数
-    u64 skipped {0};         // 被跳过的事件数
-    u64 failed {0};          // 执行失败的事件数
-    u64 filtered {0};        // 被过滤器剔除的事件数
+    u64 totalEvents {0};     // total events emitted by the merger
+    u64 processed {0};       // events actually executed (including skipped)
+    u64 skipped {0};         // events skipped
+    u64 failed {0};          // events that failed to execute
+    u64 filtered {0};        // events removed by the filter
     double firstTs {0.0};
     double lastTs {0.0};
 };
 
 /**
- * @brief 回放引擎
+ * @brief Replay engine
  */
 class ReplayEngine {
 public:
@@ -39,14 +40,15 @@ public:
                  std::ostream& log);
 
     /**
-     * @brief 执行完整回放
+     * @brief Run the full replay
      *
-     * 打开所有桶、按时间序遍历事件、节拍、执行，最后输出统计。
+     * Open all buckets, traverse events in time order, pace, execute, and
+     * finally output statistics.
      */
     [[nodiscard]] Result<ReplayStats> run();
 
 private:
-    /// 事件是否通过过滤器（pid / side）
+    /// Whether an event passes the filter (pid / side)
     [[nodiscard]] bool passesFilter(const TraceEvent& ev) const noexcept;
 
     ReplayConfig                  m_cfg;

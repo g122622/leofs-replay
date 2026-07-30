@@ -1,8 +1,9 @@
 # ============================================================================
-# 编译警告配置
+# Compile warning configuration
 #
-# 抽取为单独函数，便于在多目标间复用。遵循 Cubium 规范：把警告当作
-# 错误处理，尽早暴露问题（与"不要过度防御性编程"理念一致）。
+# Extracted into a separate function for reuse across multiple targets. Follows
+# the Cubium spec: treat warnings as errors to surface problems early (in line
+# with the "avoid excessive defensive programming" philosophy).
 # ============================================================================
 function(set_project_warnings target_name)
     set(CLANG_GCC_WARNINGS
@@ -11,7 +12,7 @@ function(set_project_warnings target_name)
         -Wpedantic
         -Wshadow
         -Wnon-virtual-dtor
-        -Wold-style-cast          # 禁止 C 风格强制转换（规范 2.3）
+        -Wold-style-cast          # forbid C-style casts (spec 2.3)
         -Wcast-align
         -Wunused
         -Woverloaded-virtual
@@ -26,8 +27,8 @@ function(set_project_warnings target_name)
 
     set(MSVC_WARNINGS
         /W4
-        /permissive-              # 严格标准
-        /WX                       # 警告视为错误
+        /permissive-              # strict standards conformance
+        /WX                       # treat warnings as errors
         /w14242                   # conversion, possible loss of data
         /w14254                   # operator conversion, possible loss of data
         /w14263                   # member function not overridden

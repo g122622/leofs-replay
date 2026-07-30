@@ -9,27 +9,30 @@
 namespace trace_replay {
 
 // ============================================================================
-// 单条 trace 事件
+// A single trace event
 //
-// 字段对齐 rawproc 的 EVENT_COLS（见 context.md）。rawproc 已按
-// (machine_ts, log_offset) 排序，本结构即 replay 引擎消费的单元。
+// Fields are aligned with rawproc's EVENT_COLS (see context.md). rawproc has
+// already sorted by (machine_ts, log_offset); this struct is the unit consumed
+// by the replay engine.
 //
-// 关键约定（与 rawproc 分工一致）：
-//   * IO 类操作（read/write/...）的 path 列不可信，replay 时以 (pid, arg1)
-//     即 fd 为准 —— arg1 在原始 trace 中是十六进制字符串，这里解析成数值后
-//     存入 arg1Num/arg2Num，便于 fd 表查找。这就是 openat-replay 的核心。
-//   * meta 类操作（openat/stat/rename/...）携带可信 path，用于真实打开/查询。
+// Key conventions (consistent with the rawproc division of labor):
+//   * For IO operations (read/write/...) the path column is unreliable; during
+//     replay (pid, arg1) — i.e. fd — is authoritative. arg1 is a hex string in
+//     the original trace; here it is parsed into a number and stored in
+//     arg1Num/arg2Num for fd-table lookup. This is the core of openat-replay.
+//   * Meta operations (openat/stat/rename/...) carry a trusted path, used for
+//     real open/query.
 // ============================================================================
 
-/// 操作大类，对齐 rawproc 的 op_class
+/// Operation category, aligned with rawproc's op_class
 enum class OpClass : u8 {
-    Unparsed,   // 无法解析的原始行（_unparsed 桶）
-    Meta,       // 路径类元数据操作：openat/stat/rename/mkdir/unlink/...
-    Io,         // IO 类操作：read/write/pread64/...（以 fd 为准）
-    Other,      // 其它有 sc 但非 meta/io
+    Unparsed,   // unparseable raw line (_unparsed bucket)
+    Meta,       // path-kind metadata operation: openat/stat/rename/mkdir/unlink/...
+    Io,         // IO operation: read/write/pread64/... (fd is authoritative)
+    Other,      // other syscalls that are neither meta nor io
 };
 
-/// 迁移侧标记，对齐 rawproc 的 side 列（source/target/other）
+/// Migration side marker, aligned with rawproc's side column (source/target/other)
 enum class Side : u8 {
     Other,
     Source,
@@ -37,49 +40,54 @@ enum class Side : u8 {
 };
 
 /**
- * @brief 单条 trace 事件
+ * @brief A single trace event
  *
- * 轻量值类型。为兼顾两种读取场景：
- *   * Parquet reader 把整桶读入内存，string 列缓冲在 Table 存活期内稳定，
- *     故 string_view 字段可安全跨多次 next() 使用；
- *   * 但归并器与调用方往往需要"拥有"事件（跨 reader 推进后仍有效）。
- * 因此对外统一返回拥有字符串所有权的副本（见 EventMerger 的 materialize）。
- * 内部 reader 阶段可临时用 string_view 指向缓冲，拷出时再物化。
+ * A lightweight value type. To serve two read scenarios:
+ *   * The Parquet reader loads a whole bucket into memory; string-column
+ *     buffers stay valid for the lifetime of the Table, so string_view fields
+ *     can safely span multiple next() calls;
+ *   * but the merger and callers often need to "own" an event (still valid
+ *     after the reader advances).
+ * Therefore the public API uniformly returns an owning copy of the strings (see
+ * EventMerger's materialize). Internally, the reader stage may temporarily use
+ * a string_view pointing into a buffer, materializing it on copy-out.
  */
 struct TraceEvent {
-    // —— 排序键（rawproc 已据此排序，replay 顺序消费即可）——
-    double machineTs {0.0};   // 机器时间戳（raw ts），全局排序主键
-    i64    logOffset {0};     // 原始字节偏移，稳定 tie-breaker
-    i64    bucket    {0};     // 所属桶编号 = floor(machineTs / 600)
+    // —— Sort keys (rawproc already sorted by these; replay consumes in order) ——
+    double machineTs {0.0};   // machine timestamp (raw ts); global sort primary key
+    i64    logOffset {0};     // original byte offset; stable tie-breaker
+    i64    bucket    {0};     // owning bucket number = floor(machineTs / 600)
 
-    // —— 进程标识 ——
+    // —— Process identity ——
     i64 pid {0};
 
-    // —— syscall 标识与分类 ——
-    std::string comm;        // 进程命令名（仅诊断用）
-    std::string sc;          // syscall 名，如 openat/read
+    // —— syscall identity and classification ——
+    std::string comm;        // process command name (diagnostic only)
+    std::string sc;          // syscall name, e.g. openat/read
     OpClass     opClass {OpClass::Other};
 
-    // —— 返回值/错误码 ——
-    i64 ret {-1};             // syscall 返回值
-    i64 err {0};              // errno（0 表示成功）
+    // —— Return value / error code ——
+    i64 ret {-1};             // syscall return value
+    i64 err {0};              // errno (0 means success)
 
-    // —— 参数 ——
-    // arg1/arg2 在原始 trace 中是十六进制字符串。对 IO 操作，arg1 即 fd；
-    // 对 openat，arg1 是 dirfd、arg2 是 flags。这里解析成数值便于使用。
+    // —— Arguments ——
+    // arg1/arg2 are hex strings in the original trace. For IO operations, arg1
+    // is fd; for openat, arg1 is dirfd and arg2 is flags. Parsed into numbers
+    // here for convenience.
     i64 arg1Num {0};
     i64 arg2Num {0};
 
-    // —— 路径（仅 meta 类操作可信）——
-    std::string path;        // 原始 path 列
-    std::string renameSrc;   // rename 的源路径（若为 rename）
-    std::string renameDst;   // rename 的目标路径（若为 rename）
-    std::string canonicalPath;  // canonical_path 列（rawproc 已映射）
-    bool mapped {false};          // 是否映射到 canonical 命名空间
+    // —— Path (trusted only for meta operations) ——
+    std::string path;        // original path column
+    std::string renameSrc;   // rename source path (if this is a rename)
+    std::string renameDst;   // rename target path (if this is a rename)
+    std::string canonicalPath;  // canonical_path column (already mapped by rawproc)
+    bool mapped {false};         // whether mapped to the canonical namespace
 
     Side side {Side::Other};
 
-    // —— 便利判定（基于 sc 的常见判别，避免在多处重复字符串比较）——
+    // —— Convenience predicates (common sc-based checks, avoiding repeated
+    //    string comparisons in multiple places) ——
     [[nodiscard]] bool isIo() const noexcept { return opClass == OpClass::Io; }
     [[nodiscard]] bool isMeta() const noexcept { return opClass == OpClass::Meta; }
     [[nodiscard]] bool isRename() const noexcept { return !renameDst.empty(); }

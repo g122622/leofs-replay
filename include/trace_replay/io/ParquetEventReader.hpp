@@ -9,28 +9,32 @@
 namespace trace_replay {
 
 // ============================================================================
-// Parquet 事件读取器
+// Parquet event reader
 //
-// 两种输入形态：
-//   1) 单个 .parquet 文件 —— 直读模式。用于用户提供的扁平 part-xxxx.parquet
-//      （已全局按 (machine_ts, log_offset) 排序，无需分桶），此时 EventMerger
-//      只挂一个读取器，K 路堆退化为直通。
-//   2) 桶目录（events_tsorted/bucket=NNNNNN）—— rawproc 标准产出。桶内可能
-//      含多个 part 文件，合并后顺序吐出；rawproc 已在桶内排序，本读取器只需
-//      顺序吐出即可，无需再排序。
+// Two input forms:
+//   1) A single .parquet file — direct-read mode. For a user-supplied flat
+//      part-xxxx.parquet (already globally sorted by (machine_ts, log_offset),
+//      no bucketing needed); here EventMerger attaches only one reader and the
+//      K-way heap degenerates to a passthrough.
+//   2) A bucket directory (events_tsorted/bucket=NNNNNN) — standard rawproc
+//      output. A bucket may contain multiple part files; they are merged and
+//      emitted in order. rawproc already sorted within the bucket, so this
+//      reader only needs to emit sequentially — no further sorting.
 //
-// 列映射对齐 rawproc 的 EVENT_COLS（见 context.md）。string_view 字段指向
-// 内部行缓冲，next() 后失效。
+// Column mapping is aligned with rawproc's EVENT_COLS (see context.md).
+// string_view fields point into the internal row buffer and are invalidated
+// after next().
 // ============================================================================
 
 /**
- * @brief 单桶/单文件 Parquet 流式读取器
+ * @brief Per-bucket / per-file streaming Parquet reader
  */
 class ParquetEventReader final : public IEventReader {
 public:
     /**
-     * @param bucketDir  桶目录路径，或单个 .parquet 文件路径
-     * @param bucket     桶编号（仅诊断用；单文件直读时可传 0）
+     * @param bucketDir  bucket directory path, or a single .parquet file path
+     * @param bucket     bucket number (diagnostic only; pass 0 for single-file
+     *                   direct read)
      */
     ParquetEventReader(std::filesystem::path bucketDir, long bucket);
     ~ParquetEventReader() override;
@@ -44,7 +48,7 @@ public:
     [[nodiscard]] long bucket() const noexcept override { return m_bucket; }
 
 private:
-    // pImpl 隔离 Arrow 头文件，避免污染公共 include
+    // pImpl to isolate Arrow headers and avoid polluting the public include
     struct Impl;
     std::unique_ptr<Impl> m_impl;
     long m_bucket;

@@ -1,11 +1,13 @@
 #pragma once
 
 // ============================================================================
-// 断言宏
+// Assertion macros
 //
-// 对齐 Cubium 规范 1.3：用断言替代冗余的防御性 if 检查，迅速暴露架构与
-// 逻辑缺陷。Release 下 MC_ASSERT_RELEASE 仍生效（开销极低），Debug 下额外
-// 触发断点。本文不引入对 MC_ASSERT 的实现细节依赖，自包含实现。
+// Aligned with Cubium spec 1.3: use assertions instead of redundant defensive
+// if-checks to quickly surface architectural and logic flaws. MC_ASSERT_RELEASE
+// stays in effect even in Release (very low cost); in Debug it additionally
+// triggers a breakpoint. This file is self-contained and does not depend on the
+// implementation details of MC_ASSERT.
 // ============================================================================
 
 #include <cassert>
@@ -23,7 +25,8 @@ namespace trace_replay::detail {
 
 }  // namespace trace_replay::detail
 
-// Release 仍生效的断言：用于校验"前置条件本应满足"的不变量。
+// Assertion that stays in effect in Release: used to verify invariants whose
+// preconditions should already hold.
 #define TR_ASSERT(expr) \
     do { \
         if (!(expr)) { \
@@ -31,7 +34,7 @@ namespace trace_replay::detail {
         } \
     } while (false)
 
-// Debug-only 断言：开销敏感、仅开发期需要的检查。
+// Debug-only assertion: for cost-sensitive checks needed only during development.
 #ifdef NDEBUG
     #define TR_ASSERT_DEBUG(expr) ((void)0)
 #else

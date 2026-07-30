@@ -1,4 +1,4 @@
-# 构建产物
+# Build artifacts
 /build/
 /out/
 /bin/
@@ -11,7 +11,7 @@ cmake_install.cmake
 *.cmake.user
 compile_commands.json
 
-# 编译器/IDE
+# Compiler / IDE
 .vs/
 .vscode/
 .idea/
@@ -22,10 +22,10 @@ compile_commands.json
 *.pdb
 *.exe
 
-# Claude / 本地会话
+# Claude / local sessions
 .claude/
 
-# 临时与备份
+# Temporary and backup
 *.log
 *.tmp
 *~

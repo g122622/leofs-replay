@@ -9,16 +9,17 @@
 namespace trace_replay {
 
 // ============================================================================
-// 事件路径/fd 工具
+// Event path/fd utilities
 //
-// 配合 FdTable 的 path 反查策略：
-//   * bestLookupPath(ev) —— 取用于 fd 反查的归一路径：优先 canonical_path，
-//     退化用 path。read/write/close 都用它去 fd 表反查 ourFd。
-//   * extractUnknownFd(path) —— 从 "/[unknown, fd=N]" 形态提取 N，用于
-//     path 不可解析时的 fd 直查回退。
+// Supports the FdTable's path reverse-lookup strategy:
+//   * bestLookupPath(ev) — the unified path used for fd reverse-lookup:
+//     prefer canonical_path, fall back to path. read/write/close all use it to
+//     reverse-look up ourFd in the fd table.
+//   * extractUnknownFd(path) — extract N from the "/[unknown, fd=N]" form, used
+//     as a direct fd-lookup fallback when the path cannot be parsed.
 // ============================================================================
 
-/// 取事件用于 fd 反查的归一路径（canonical_path 优先，否则 path）
+/// The unified path used for fd reverse-lookup (canonical_path preferred, else path)
 [[nodiscard]] inline std::string_view bestLookupPath(const TraceEvent& ev)
 {
     if (ev.mapped && !ev.canonicalPath.empty()) {
@@ -27,10 +28,10 @@ namespace trace_replay {
     return ev.path;
 }
 
-/// 从 "/[unknown, fd=N]" 形态提取 fd=N；非该形态返回 nullopt
+/// Extract fd=N from the "/[unknown, fd=N]" form; returns nullopt if not that form
 [[nodiscard]] inline std::optional<Fd> extractUnknownFd(std::string_view path)
 {
-    // 形如 "/[unknown, fd=26]" —— 定位 "fd=" 后的数字
+    // Of the form "/[unknown, fd=26]" — locate the digits after "fd="
     constexpr std::string_view marker = "fd=";
     auto pos = path.find(marker);
     if (pos == std::string_view::npos) {

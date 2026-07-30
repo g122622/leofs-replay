@@ -10,83 +10,89 @@
 namespace trace_replay {
 
 // ============================================================================
-// fd 表 —— openat-replay 的核心
+// fd table — the core of openat-replay
 //
-// 真实 rawproc 输出（已验证）的 fd 语义：
-//   * openat 的 ret = 原始 fd（小整数）；arg1 = flags（十进制）。
-//   * read/write 的 arg1 = 请求字节数 count（不是 fd），fd 信息不在 arg。
-//     其 path 列绝大多数是已解析的完整路径，少数为 "/[unknown, fd=N]"。
-//   * close 的 arg1/ret 均为 0，fd 同样靠 path。
+// fd semantics in real rawproc output (verified):
+//   * openat's ret = the original fd (a small integer); arg1 = flags (decimal).
+//   * read/write's arg1 = the requested byte count (not fd); the fd info is not
+//     in any arg. Its path column is a resolved full path in the vast majority
+//     of cases, with a few in the form "/[unknown, fd=N]".
+//   * close's arg1/ret are both 0; the fd likewise comes from path.
 //
-// 因此 fd 跟踪策略：
-//   * openat 成功 → 用 (pid, origFd=ret) 建表，并记录 path；
-//   * read/write/close → 优先用 path（canonical_path 优先）在同 pid 表里
-//     反查 ourFd（同路径即同 fd）；path 为 "/[unknown, fd=N]" 时从其中
-//     提取 N 直查 (pid, N)。
+// Hence the fd tracking strategy:
+//   * openat success → build the table with (pid, origFd=ret) and record path;
+//   * read/write/close → prefer path (canonical_path first) to reverse-look up
+//     ourFd in the same pid's table (same path = same fd); when path is
+//     "/[unknown, fd=N]", extract N and directly look up (pid, N).
 //
-// 维护两张索引：fd 索引（origFd→entry）与 path 索引（canonicalPath→entry），
-// openat 注册、close 注销时同步更新两者。path 索引允许同一路径被多次打开
-// （多个 fd 指向同路径），取最近一次登记的 ourFd。
+// Two indices are maintained: the fd index (origFd→entry) and the path index
+// (canonicalPath→entry), updated in sync on openat registration and close
+// unregistration. The path index allows the same path to be opened multiple
+// times (multiple fds pointing to the same path); the most recently registered
+// ourFd is taken.
 // ============================================================================
 
 /**
- * @brief 单条 fd 映射条目
+ * @brief A single fd mapping entry
  */
 struct FdEntry {
-    Fd  ourFd {-1};          // 本回放进程真实打开的 fd（-1 表示未占用）
-    std::string path;        // canonical_path（沙箱解析前的原始归一路径），用于反查
+    Fd  ourFd {-1};          // the fd actually opened by this replay process (-1 = not in use)
+    std::string path;        // canonical_path (the original unified path before sandbox resolution), used for reverse-lookup
     bool isDirectory {false};
 };
 
 /**
- * @brief per-pid fd 映射表，支持 fd 直查与 path 反查
+ * @brief per-pid fd mapping table, supporting direct fd lookup and path reverse-lookup
  */
 class FdTable {
 public:
     FdTable() = default;
 
     /**
-     * @brief 登记一次成功的 open
+     * @brief Register a successful open
      *
-     * @param pid      原始进程 id
-     * @param origFd   原始 trace 中 openat 返回的 fd（即该 fd 的查找键）
-     * @param ourFd    本进程真实打开得到的 fd
-     * @param path     canonical_path（用于 IO/close 反查）
-     * @param isDir    是否目录
+     * @param pid      original process id
+     * @param origFd   the fd returned by openat in the original trace (i.e. the
+     *                 lookup key for this fd)
+     * @param ourFd    the fd actually opened by this process
+     * @param path     canonical_path (used for IO/close reverse-lookup)
+     * @param isDir    whether it is a directory
      */
     void registerFd(i64 pid, Fd origFd, Fd ourFd, std::string path, bool isDir);
 
     /**
-     * @brief 注销一个原始 fd（fd 直查路径，用于 "/[unknown, fd=N]"）
+     * @brief Unregister an original fd (direct fd-lookup path, for "/[unknown, fd=N]")
      *
-     * @return 本进程 ourFd（供调用方关闭），nullopt 表示该 (pid,origFd) 未登记
+     * @return this process's ourFd (for the caller to close); nullopt means the
+     *         (pid,origFd) was not registered
      */
     [[nodiscard]] std::optional<Fd> unregisterFd(i64 pid, Fd origFd);
 
     /**
-     * @brief 按 path 反查并注销（用于 path 已解析的 close）
+     * @brief Reverse-lookup by path and unregister (for close with a resolved path)
      *
-     * 取该 pid 下最近一次登记该 path 的 ourFd 并注销。返回 ourFd 供关闭；
-     * nullopt 表示该 (pid,path) 未登记。
+     * Takes the most recently registered ourFd for that path under this pid and
+     * unregisters it. Returns ourFd for closing; nullopt means the (pid,path)
+     * was not registered.
      */
     [[nodiscard]] std::optional<Fd> unregisterByPath(i64 pid, std::string_view path);
 
-    /// 按 fd 直查条目（IO/close 在 "/[unknown, fd=N]" 时使用）
+    /// Direct lookup by fd (used by IO/close in the "/[unknown, fd=N]" case)
     [[nodiscard]] const FdEntry* lookup(i64 pid, Fd origFd) const;
 
-    /// 按 path 反查条目（IO/close 在 path 已解析时使用）
+    /// Reverse-lookup by path (used by IO/close when path is resolved)
     [[nodiscard]] const FdEntry* lookupByPath(i64 pid, std::string_view path) const;
 
-    /// 关闭并清空某个 pid 的全部映射（进程退出时调用）
+    /// Close and clear all mappings for a pid (called when the process exits)
     void closePid(i64 pid);
 
-    /// 当前登记的映射总数（诊断用）
+    /// Total number of currently registered mappings (diagnostic)
     [[nodiscard]] size_t size() const noexcept;
 
 private:
     struct PerPid {
         std::unordered_map<Fd, FdEntry> byFd;
-        // path → 最近一次登记的 origFd（指向 byFd 中的条目）
+        // path → most recently registered origFd (points to an entry in byFd)
         std::unordered_map<std::string, Fd> byPath;
     };
     std::unordered_map<i64, PerPid> m_table;

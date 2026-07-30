@@ -12,11 +12,13 @@
 namespace trace_replay {
 
 // ============================================================================
-// 回放节拍模式
+// Replay pacing mode
 //
-//   Fast      —— 不 sleep，尽快按时间序处理（默认，关注正确性与吞吐）
-//   Real      —— 按原始事件间墙钟间隔 sleep，1:1 还原真实时间分布
-//   Scaled    —— 按 speed 比例缩放间隔（speed>1 加速，<1 减速）
+//   Fast      — no sleep; process in time order as fast as possible (default;
+//               focuses on correctness and throughput)
+//   Real      — sleep the original wall-clock gap between events; reproduce the
+//               real-time distribution 1:1
+//   Scaled    — scale the gap by `speed` (speed>1 faster, <1 slower)
 // ============================================================================
 
 enum class PaceMode : u8 {
@@ -26,62 +28,66 @@ enum class PaceMode : u8 {
 };
 
 /**
- * @brief replay 运行配置
+ * @brief replay run configuration
  *
- * 由 JSON 配置文件构造（见 ReplayConfig::loadFromJson）。所有路径均相对
- * 沙箱根 sandboxRoot 解析并做防穿越校验。字段命名对齐 JSON key（snake_case）。
+ * Constructed from a JSON config file (see ReplayConfig::loadFromJson). All
+ * paths are resolved relative to the sandbox root sandboxRoot and checked for
+ * path traversal. Field names align with the JSON keys (snake_case).
  */
 struct ReplayConfig {
-    // —— 输入 ——
-    /// rawproc 产出根目录，其下应有 events_tsorted/bucket=xxxxxx
+    // —— Input ——
+    /// rawproc output root directory; should contain events_tsorted/bucket=xxxxxx
     std::filesystem::path eventsRoot;
-    /// 桶目录名宽度（默认 6，对齐 rawproc width=max(6, ...)）
+    /// Bucket directory name width (default 6, aligned with rawproc width=max(6, ...))
     int bucketWidth {6};
-    /// 只回放指定范围内的桶（闭区间），留空表示全部
+    /// Only replay buckets within the specified range (closed interval); empty means all
     long bucketMin {0};
-    long bucketMax {-1};   // <0 表示无上限
+    long bucketMax {-1};   // <0 means no upper bound
 
-    // —— 沙箱 ——
-    /// 真实 syscall 的根目录，所有 replay 路径都限制在其下
+    // —— Sandbox ——
+    /// Root directory for real syscalls; all replay paths are confined under it
     std::filesystem::path sandboxRoot;
 
-    // —— 节拍 ——
+    // —— Pacing ——
     PaceMode paceMode {PaceMode::Fast};
-    /// Scaled 模式下的倍速（2.0 = 两倍速回放）
+    /// Speed multiplier in Scaled mode (2.0 = two-times-speed replay)
     double speed {1.0};
 
-    // —— 过滤 ——
-    /// 只回放这些 pid 的事件（空表示全部）
+    // —— Filtering ——
+    /// Only replay events of these pids (empty means all)
     std::vector<i64> pidFilter;
-    /// 只回放 source 侧 / target 侧 / 全部
-    Side sideFilter {Side::Other};   // Other 表示不过滤
-    /// 是否跳过 _unparsed / null_ts 桶
+    /// Only replay the source side / target side / all
+    Side sideFilter {Side::Other};   // Other means no filtering
+    /// Whether to skip _unparsed / null_ts buckets
     bool skipUnparsed {true};
 
-    // —— 行为 ——
-    /// 是否只做 dry-run（不执行真实 syscall，仅打印/统计）
+    // —— Behavior ——
+    /// Whether to only do a dry-run (no real syscalls, just print/count)
     bool dryRun {false};
-    /// read/write 时单次最大字节数（避免一次性读过大的 trace offset）
-    i64 maxIoBytes {1 << 20};   // 默认 1 MiB
-    /// 遇到 syscall 失败时是否继续（true=跳过并计数，false=中止）
+    /// Max bytes per read/write (avoids reading an oversized trace offset at once)
+    i64 maxIoBytes {1 << 20};   // default 1 MiB
+    /// Whether to continue on syscall failure (true = skip and count, false = abort)
     bool continueOnError {true};
-    /// 回放事件上限（>0 时处理到该数量即停，便于对大文件做有界 dry-run；0=不限）
+    /// Replay event cap (>0 stops after that many; useful for a bounded dry-run on a
+    /// large file; 0 = unlimited)
     u64 maxEvents {0};
 
     /**
-     * @brief 从 JSON 配置文件加载
+     * @brief Load from a JSON config file
      *
-     * 期望的 JSON 结构示例见 README。缺失字段使用结构体默认值。
+     * See README for an example of the expected JSON structure. Missing fields
+     * use the struct defaults.
      *
-     * @param path JSON 配置文件路径
+     * @param path JSON config file path
      * @return Result<ReplayConfig>
      */
     [[nodiscard]] static Result<ReplayConfig> loadFromJson(std::string_view path);
 
     /**
-     * @brief 校验配置合法性并规范化路径
+     * @brief Validate the config and normalize paths
      *
-     * 将相对路径转为绝对、检查 sandboxRoot 存在、eventsRoot 存在等。
+     * Converts relative paths to absolute, checks that sandboxRoot exists,
+     * eventsRoot exists, etc.
      */
     [[nodiscard]] Result<void> validate();
 };
